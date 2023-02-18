@@ -1,4 +1,11 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -11,10 +18,20 @@
 #include "bindings.h"
 #include "column.h"
 #include "functions/functions.h" // @manual=//pytorch/torcharrow/csrc/velox/functions:torcharrow_functions
+#include "tensor_conversion.h"
+#include "vector.h"
 #include "velox/buffer/StringViewBufferHolder.h"
-#include "velox/functions/prestosql/SimpleFunctions.h"
-#include "velox/functions/prestosql/VectorFunctions.h"
+#include "velox/common/base/Exceptions.h"
+#include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/type/Type.h"
 #include "velox/vector/TypeAliases.h"
+#include "velox/vector/arrow/Abi.h"
+#include "velox/vector/arrow/Bridge.h"
+
+#ifdef USE_TORCH
+#include <torch/csrc/utils/pybind.h> // @manual
+#include "functions/text/gpt2_bpe_tokenizer.h" // @manual
+#endif
 
 #define STRINGIFY(x) #x
 #define MACRO_STRINGIFY(x) STRINGIFY(x)
@@ -24,14 +41,13 @@ namespace py = pybind11;
 PYBIND11_MAKE_OPAQUE(std::vector<bool>);
 
 namespace facebook::torcharrow {
-
 //
 // SimpleColumn (scalar types)
 //
 
 // Based on VectorMaker::flatVectorNullable in Velox
-template <typename T>
-velox::FlatVectorPtr<T> flatVectorFromPyList(const py::list& data) {
+template <typename T, typename PySequence>
+velox::FlatVectorPtr<T> flatVectorFromPySequence(const PySequence& data) {
   // TODO
   // Consider using the pattern used in arrayVectorFromPyList for creating the
   // underlying FlatVector, which creates an empty vector using
@@ -57,16 +73,17 @@ velox::FlatVectorPtr<T> flatVectorFromPyList(const py::list& data) {
     if (!data[i].is_none()) {
       // Using bitUtils for bool vectors.
       if constexpr (std::is_same<T, bool>::value) {
-        velox::bits::setBit(rawData, i, data[i].cast<bool>());
+        velox::bits::setBit(rawData, i, data[i].template cast<bool>());
       } else if constexpr (std::is_same<T, velox::StringView>::value) {
         // Two memcpy's happen here: pybind11::object casting to std::string and
         // StringViewBufferHolder copying data from the buffer in the
         // std::string onto the buffers it manages. We can teach
         // StringViewBufferHolder how to copy data from
         // pybind11::str/pybind11::object to skip one copy
-        rawData[i] = stringArena.getOwnedValue(data[i].cast<std::string>());
+        rawData[i] =
+            stringArena.getOwnedValue(data[i].template cast<std::string>());
       } else {
-        rawData[i] = data[i].cast<T>();
+        rawData[i] = data[i].template cast<T>();
       }
       velox::bits::setNull(rawNulls, i, false);
     } else {
@@ -135,8 +152,60 @@ py::class_<SimpleColumn<T>, BaseColumn> declareSimpleType(
       "Column",
       [](std::shared_ptr<I> type,
          py::list data) -> std::unique_ptr<SimpleColumn<T>> {
-        return std::make_unique<SimpleColumn<T>>(flatVectorFromPyList<T>(data));
+        return std::make_unique<SimpleColumn<T>>(
+            flatVectorFromPySequence<T>(data));
       });
+  // Column construction from Python tuple
+  m.def(
+      "Column",
+      [](std::shared_ptr<I> type,
+         py::tuple data) -> std::unique_ptr<SimpleColumn<T>> {
+        return std::make_unique<SimpleColumn<T>>(
+            flatVectorFromPySequence<T>(data));
+      });
+
+  // Import/Export Arrow data
+  //
+  // VARCHAR is not supported at the moment
+  // https://github.com/facebookincubator/velox/blob/f420d3115eeb8ad782aa9979f47be03671ed02f4/velox/vector/arrow/Bridge.cpp#L128
+  if constexpr (
+      kind == velox::TypeKind::BOOLEAN || kind == velox::TypeKind::TINYINT ||
+      kind == velox::TypeKind::SMALLINT || kind == velox::TypeKind::INTEGER ||
+      kind == velox::TypeKind::BIGINT || kind == velox::TypeKind::REAL ||
+      kind == velox::TypeKind::DOUBLE) {
+    // _torcharrow._import_from_arrow
+    m.def(
+        "_import_from_arrow",
+        [](std::shared_ptr<I> type, uintptr_t ptrArray, uintptr_t ptrSchema) {
+          ArrowArray* castedArray = reinterpret_cast<ArrowArray*>(ptrArray);
+          ArrowSchema* castedSchema = reinterpret_cast<ArrowSchema*>(ptrSchema);
+          VELOX_CHECK_NOT_NULL(castedArray);
+          VELOX_CHECK_NOT_NULL(castedSchema);
+
+          auto column =
+              std::make_unique<SimpleColumn<T>>(velox::importFromArrowAsOwner(
+                  *castedSchema,
+                  *castedArray,
+                  TorchArrowGlobalStatic::rootMemoryPool()));
+
+          VELOX_CHECK(
+              column->type()->kind() == kind,
+              "Expected TypeKind is {} but Velox created {}",
+              velox::TypeTraits<kind>::name,
+              column->type()->kindName());
+
+          return column;
+        });
+
+    // _torcharrow.SimpleColumn<Type>._export_to_arrow
+    result.def(
+        "_export_to_arrow", [](SimpleColumn<T>& self, uintptr_t ptrArray) {
+          ArrowArray* castedArray = reinterpret_cast<ArrowArray*>(ptrArray);
+          VELOX_CHECK_NOT_NULL(castedArray);
+
+          self.exportToArrow(castedArray);
+        });
+  }
 
   return result;
 };
@@ -296,6 +365,7 @@ py::class_<SimpleColumn<T>, BaseColumn> declareNumericalType(py::module& m) {
       declareSimpleType<kind>(m, [](auto val) { return py::cast(val); })
           .def("neg", &SimpleColumn<T>::neg)
           .def("abs", &SimpleColumn<T>::abs)
+          .def("cast", &SimpleColumn<T>::cast)
           // Defining three methods for each binary operation: one for column *
           // column, one for column * scalar, and one for scalar * column. Note
           // that the scalar * column form is for reverse operations, which is
@@ -367,6 +437,48 @@ py::class_<SimpleColumn<T>, BaseColumn> declareNumericalType(py::module& m) {
                     b, BinaryOpCode::Multiply, OperatorType::Reverse);
               })
           .def(
+              "truediv",
+              [](SimpleColumn<T>& a,
+                 const BaseColumn& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Divide, OperatorType::Direct);
+              })
+          .def(
+              "truediv",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Divide, OperatorType::Direct);
+              })
+          .def(
+              "rtruediv",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Divide, OperatorType::Reverse);
+              })
+          .def(
+              "floordiv",
+              [](SimpleColumn<T>& a,
+                 const BaseColumn& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Floordiv, OperatorType::Direct);
+              })
+          .def(
+              "floordiv",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Floordiv, OperatorType::Direct);
+              })
+          .def(
+              "rfloordiv",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Floordiv, OperatorType::Reverse);
+              })
+          .def(
               "mod",
               [](SimpleColumn<T>& a,
                  const BaseColumn& b) -> std::unique_ptr<BaseColumn> {
@@ -386,6 +498,27 @@ py::class_<SimpleColumn<T>, BaseColumn> declareNumericalType(py::module& m) {
                  const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
                 return a.callBinaryOp(
                     b, BinaryOpCode::Modulus, OperatorType::Reverse);
+              })
+          .def(
+              "pow",
+              [](SimpleColumn<T>& a,
+                 const BaseColumn& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Pow, OperatorType::Direct);
+              })
+          .def(
+              "pow",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Pow, OperatorType::Direct);
+              })
+          .def(
+              "rpow",
+              [](SimpleColumn<T>& a,
+                 const pybind11::handle& b) -> std::unique_ptr<BaseColumn> {
+                return a.callBinaryOp(
+                    b, BinaryOpCode::Pow, OperatorType::Reverse);
               });
   declareComparisons(pyClass);
 
@@ -400,9 +533,7 @@ py::class_<SimpleColumn<T>, BaseColumn> declareIntegralType(py::module& m) {
       declareNumericalType<kind>(m)
           .def(
               "append",
-              [](SimpleColumn<T>& self, py::int_ value) {
-                self.append(py::cast<T>(value));
-              })
+              [](SimpleColumn<T>& self, T value) { self.append(value); })
           .def("invert", &SimpleColumn<T>::invert);
   declareBitwiseOperations(pyClass);
 
@@ -414,16 +545,7 @@ template <
     typename T = typename velox::TypeTraits<kind>::NativeType>
 py::class_<SimpleColumn<T>, BaseColumn> declareFloatingType(py::module& m) {
   return declareNumericalType<kind>(m)
-      .def(
-          "append",
-          [](SimpleColumn<T>& self, py::float_ value) {
-            self.append(py::cast<T>(value));
-          })
-      .def(
-          "append",
-          [](SimpleColumn<T>& self, py::int_ value) {
-            self.append(py::cast<T>(value));
-          })
+      .def("append", [](SimpleColumn<T>& self, T value) { self.append(value); })
       .def("ceil", &SimpleColumn<T>::ceil)
       .def("floor", &SimpleColumn<T>::floor)
       .def("round", &SimpleColumn<T>::round);
@@ -437,7 +559,9 @@ py::class_<SimpleColumn<T>, BaseColumn> declareFloatingType(py::module& m) {
 template <
     velox::TypeKind kind,
     typename T = typename velox::TypeTraits<kind>::NativeType>
-velox::ArrayVectorPtr arrayVectorFromPyList(const py::list& data) {
+velox::ArrayVectorPtr arrayVectorFromPyList(
+    int fixed_size,
+    const py::list& data) {
   using velox::vector_size_t;
 
   // Prepare the arguments for creating ArrayVector
@@ -504,9 +628,13 @@ velox::ArrayVectorPtr arrayVectorFromPyList(const py::list& data) {
   }
   flatVector->setNullCount(elementNullCount);
 
+  const auto typ = fixed_size == -1
+      ? velox::ARRAY(velox::CppToType<T>::create())
+      : velox::FIXED_SIZE_ARRAY(fixed_size, velox::CppToType<T>::create());
+
   return std::make_shared<velox::ArrayVector>(
       TorchArrowGlobalStatic::rootMemoryPool(),
-      velox::ARRAY(velox::CppToType<T>::create()),
+      typ,
       nulls,
       data.size(),
       offsets,
@@ -516,6 +644,7 @@ velox::ArrayVectorPtr arrayVectorFromPyList(const py::list& data) {
 }
 
 velox::ArrayVectorPtr arrayVectorFromPyListByType(
+    int fixed_size,
     velox::TypePtr elementType,
     const py::list& data) {
   switch (elementType->kind()) {
@@ -536,7 +665,7 @@ velox::ArrayVectorPtr arrayVectorFromPyListByType(
     }
     default: {
       return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          arrayVectorFromPyList, elementType->kind(), data);
+          arrayVectorFromPyList, elementType->kind(), fixed_size, data);
       break;
     }
   }
@@ -548,7 +677,8 @@ void declareArrayType(py::module& m) {
       .def("append_null", &ArrayColumn::appendNull)
       .def("__getitem__", &ArrayColumn::valueAt)
       .def("elements", &ArrayColumn::elements)
-      .def("slice", &ArrayColumn::slice);
+      .def("slice", &ArrayColumn::slice)
+      .def("withElements", &ArrayColumn::withElements);
 
   using I = typename velox::TypeTraits<velox::TypeKind::ARRAY>::ImplType;
   py::class_<I, velox::Type, std::shared_ptr<I>>(
@@ -559,17 +689,35 @@ void declareArrayType(py::module& m) {
       .def(py::init<velox::TypePtr>())
       .def("element_type", &velox::ArrayType::elementType);
 
+  using J = typename velox::FixedSizeArrayType;
+  py::class_<J, velox::Type, std::shared_ptr<J>>(
+      m, "VeloxFixedArrayType", py::module_local())
+      .def(py::init<int, velox::TypePtr>())
+      .def("element_type", &velox::FixedSizeArrayType::elementType)
+      .def("fixed_width", &velox::FixedSizeArrayType::fixedElementsWidth);
+
   // Empty Column
   m.def("Column", [](std::shared_ptr<I> type) {
     return std::make_unique<ArrayColumn>(type);
   });
+  m.def("Column", [](std::shared_ptr<J> type) {
+    return std::make_unique<ArrayColumn>(type);
+  });
+
   // Column construction from Python list
   m.def(
       "Column",
       [](std::shared_ptr<I> type,
          py::list data) -> std::unique_ptr<ArrayColumn> {
         return std::make_unique<ArrayColumn>(
-            arrayVectorFromPyListByType(type->elementType(), data));
+            arrayVectorFromPyListByType(-1, type->elementType(), data));
+      });
+  m.def(
+      "Column",
+      [](std::shared_ptr<J> type,
+         py::list data) -> std::unique_ptr<ArrayColumn> {
+        return std::make_unique<ArrayColumn>(arrayVectorFromPyListByType(
+            type->fixedElementsWidth(), type->elementType(), data));
       });
 }
 
@@ -615,7 +763,13 @@ void declareRowType(py::module& m) {
       .def("slice", &RowColumn::slice)
       .def("set_length", &RowColumn::setLength)
       .def("set_null_at", &RowColumn::setNullAt)
-      .def("copy", &RowColumn::copy);
+      .def("copy", &RowColumn::copy)
+      .def("_export_to_arrow", [](RowColumn& self, uintptr_t ptrArray) {
+        ArrowArray* castedArray = reinterpret_cast<ArrowArray*>(ptrArray);
+        VELOX_CHECK_NOT_NULL(castedArray);
+
+        self.exportToArrow(castedArray);
+      });
 
   using I = typename velox::TypeTraits<velox::TypeKind::ROW>::ImplType;
   py::class_<I, velox::Type, std::shared_ptr<I>>(
@@ -634,6 +788,28 @@ void declareRowType(py::module& m) {
   m.def("Column", [](std::shared_ptr<I> type) {
     return std::make_unique<RowColumn>(type);
   });
+  // _torcharrow._import_from_arrow
+  m.def(
+      "_import_from_arrow",
+      [](std::shared_ptr<I> type, uintptr_t ptrArray, uintptr_t ptrSchema) {
+        ArrowArray* castedArray = reinterpret_cast<ArrowArray*>(ptrArray);
+        ArrowSchema* castedSchema = reinterpret_cast<ArrowSchema*>(ptrSchema);
+        VELOX_CHECK_NOT_NULL(castedArray);
+        VELOX_CHECK_NOT_NULL(castedSchema);
+
+        auto column = std::make_unique<RowColumn>(velox::importFromArrowAsOwner(
+            *castedSchema,
+            *castedArray,
+            TorchArrowGlobalStatic::rootMemoryPool()));
+
+        VELOX_CHECK(
+            column->type()->kind() == velox::TypeKind::ROW,
+            "Expected TypeKind is {} but Velox created {}",
+            velox::TypeTraits<velox::TypeKind::ROW>::name,
+            column->type()->kindName());
+
+        return column;
+      });
 }
 
 PYBIND11_MODULE(_torcharrow, m) {
@@ -689,19 +865,24 @@ PYBIND11_MODULE(_torcharrow, m) {
   declareIntegralType<velox::TypeKind::SMALLINT>(m);
   declareIntegralType<velox::TypeKind::TINYINT>(m);
 
-  auto boolColumnClass = declareSimpleType<velox::TypeKind::BOOLEAN>(
-                             m, [](auto val) { return py::cast(val); })
-                             .def(
-                                 "append",
-                                 [](SimpleColumn<bool>& self, py::bool_ value) {
-                                   self.append(py::cast<bool>(value));
-                                 })
-                             .def(
-                                 "append",
-                                 [](SimpleColumn<bool>& self, py::int_ value) {
-                                   self.append(py::cast<bool>(value));
-                                 })
-                             .def("invert", &SimpleColumn<bool>::invert);
+  using BIGINTNativeType =
+      velox::TypeTraits<velox::TypeKind::BIGINT>::NativeType;
+  auto boolColumnClass =
+      declareSimpleType<velox::TypeKind::BOOLEAN>(
+          m, [](auto val) { return py::cast(val); })
+          .def("cast", &SimpleColumn<bool>::cast)
+          .def(
+              "append",
+              [](SimpleColumn<bool>& self, bool value) { self.append(value); },
+              // explicitly disallow all conversions to bools; enabling
+              // this allows `None` and floats to convert to bools
+              py::arg("value").noconvert())
+          .def(
+              "append",
+              [](SimpleColumn<bool>& self, BIGINTNativeType value) {
+                self.append(static_cast<bool>(value));
+              })
+          .def("invert", &SimpleColumn<bool>::invert);
   declareComparisons(boolColumnClass);
   declareBitwiseOperations(boolColumnClass);
 
@@ -718,13 +899,7 @@ PYBIND11_MODULE(_torcharrow, m) {
           "append",
           [](SimpleColumn<velox::StringView>& self, const std::string& value) {
             self.append(velox::StringView(value));
-          })
-      .def("lower", &SimpleColumn<velox::StringView>::lower)
-      .def("upper", &SimpleColumn<velox::StringView>::upper)
-      .def("isalpha", &SimpleColumn<velox::StringView>::isalpha)
-      .def("isalnum", &SimpleColumn<velox::StringView>::isalnum)
-      .def("isinteger", &SimpleColumn<velox::StringView>::isinteger)
-      .def("islower", &SimpleColumn<velox::StringView>::islower);
+          });
 
   declareArrayType(m);
   declareMapType(m);
@@ -735,32 +910,146 @@ PYBIND11_MODULE(_torcharrow, m) {
     return BaseColumn::createConstantColumn(
         pyToVariant(value), py::cast<velox::vector_size_t>(size));
   });
+  m.def(
+      "ConstantColumn",
+      [](const py::handle& value,
+         py::int_ size,
+         std::shared_ptr<velox::Type> type) {
+        return BaseColumn::createConstantColumn(
+            pyToVariantTyped(value, type),
+            py::cast<velox::vector_size_t>(size));
+      });
 
   declareUserDefinedBindings(m);
 
   // generic UDF dispatch
-  m.def("generic_udf_dispatch", &BaseColumn::genericUnaryUDF);
-  m.def("generic_udf_dispatch", &BaseColumn::genericBinaryUDF);
-  m.def("generic_udf_dispatch", &BaseColumn::genericTrinaryUDF);
+  m.def("generic_udf_dispatch", &BaseColumn::genericUDF);
 
-  // factory UDF dispatch
+  // factory UDF dispatch (e.g. UDF without any parameters, length is required
+  // for such UDF call)
   m.def("factory_udf_dispatch", &BaseColumn::factoryNullaryUDF);
+
+  // Tensor conversion related binding
+  m.def(
+      "_populate_dense_features_nopresence",
+      [](const RowColumn& column, uintptr_t dataTensorPtr) {
+        populateDenseFeaturesNoPresence(
+            std::dynamic_pointer_cast<velox::RowVector>(
+                column.getUnderlyingVeloxVector()),
+            column.getOffset(),
+            column.getLength(),
+            dataTensorPtr);
+      });
 
   py::register_exception<NotAppendableException>(m, "NotAppendableException");
 
   // Register Velox UDFs
   // TODO: we may only need to register UDFs that TorchArrow required?
-  velox::functions::registerFunctions();
-  velox::functions::registerVectorFunctions();
+  velox::functions::prestosql::registerAllScalarFunctions();
 
   functions::registerTorchArrowFunctions();
 
   functions::registerUserDefinedFunctions();
 
+  // Is library built with torch
+  m.def("is_built_with_torch", []() {
+#ifdef USE_TORCH
+    return true;
+#else
+    return false;
+#endif
+  });
+
 #ifdef VERSION_INFO
   m.attr("__version__") = MACRO_STRINGIFY(VERSION_INFO);
 #else
   m.attr("__version__") = "dev";
+#endif
+#ifdef USE_TORCH
+  py::class_<functions::Vocab, c10::intrusive_ptr<functions::Vocab>>(m, "Vocab")
+      .def(py::init<functions::StringList, c10::optional<int64_t>>())
+      .def_readonly("itos_", &functions::Vocab::itos_)
+      .def_readonly("default_index_", &functions::Vocab::default_index_)
+      .def(
+          "__contains__",
+          [](c10::intrusive_ptr<functions::Vocab>& self,
+             const py::str& item) -> bool {
+            Py_ssize_t length;
+            const char* buffer = PyUnicode_AsUTF8AndSize(item.ptr(), &length);
+            return self->__contains__(c10::string_view{buffer, (size_t)length});
+          })
+      .def(
+          "__getitem__",
+          [](c10::intrusive_ptr<functions::Vocab>& self,
+             const py::str& item) -> int64_t {
+            Py_ssize_t length;
+            const char* buffer = PyUnicode_AsUTF8AndSize(item.ptr(), &length);
+            return self->__getitem__(c10::string_view{buffer, (size_t)length});
+          })
+      .def("insert_token", &functions::Vocab::insert_token)
+      .def("set_default_index", &functions::Vocab::set_default_index)
+      .def("get_default_index", &functions::Vocab::get_default_index)
+      .def("__len__", &functions::Vocab::__len__)
+      .def("append_token", &functions::Vocab::append_token)
+      .def("lookup_token", &functions::Vocab::lookup_token)
+      .def("lookup_tokens", &functions::Vocab::lookup_tokens)
+      .def(
+          "lookup_indices",
+          [](const c10::intrusive_ptr<functions::Vocab>& self,
+             const py::list& items) {
+            std::vector<int64_t> indices(items.size());
+            int64_t counter = 0;
+            for (const auto& item : items) {
+              Py_ssize_t length;
+              const char* buffer = PyUnicode_AsUTF8AndSize(item.ptr(), &length);
+              indices[counter++] =
+                  self->__getitem__(c10::string_view{buffer, (size_t)length});
+            }
+            return indices;
+          })
+      .def("get_stoi", &functions::Vocab::get_stoi)
+      .def("get_itos", &functions::Vocab::get_itos)
+      .def(py::pickle(
+          // __getstate__
+          [](const c10::intrusive_ptr<functions::Vocab>& self)
+              -> functions::VocabStates {
+            return functions::_serialize_vocab(self);
+          },
+          // __setstate__
+          [](functions::VocabStates states)
+              -> c10::intrusive_ptr<functions::Vocab> {
+            return functions::_deserialize_vocab(states);
+          }));
+
+  // text operator
+  py::class_<
+      functions::GPT2BPEEncoder,
+      c10::intrusive_ptr<functions::GPT2BPEEncoder>>(m, "GPT2BPEEncoder")
+      .def(py::init<
+           std::unordered_map<std::string, int64_t>,
+           std::unordered_map<std::string, int64_t>,
+           std::string,
+           std::unordered_map<int64_t, std::string>,
+           bool>())
+      .def_property_readonly(
+          "bpe_encoder_", &functions::GPT2BPEEncoder::GetBPEEncoder)
+      .def_property_readonly(
+          "bpe_merge_ranks_", &functions::GPT2BPEEncoder::GetBPEMergeRanks)
+      .def_readonly("seperator_", &functions::GPT2BPEEncoder::seperator_)
+      .def_property_readonly(
+          "byte_encoder_", &functions::GPT2BPEEncoder::GetByteEncoder)
+      .def("encode", &functions::GPT2BPEEncoder::Encode)
+      .def(py::pickle(
+          // __getstate__
+          [](const c10::intrusive_ptr<functions::GPT2BPEEncoder>& self)
+              -> functions::GPT2BPEEncoderStatesPybind {
+            return functions::_serialize_gpt2_bpe_encoder_pybind(self);
+          },
+          // __setstate__
+          [](functions::GPT2BPEEncoderStatesPybind states)
+              -> c10::intrusive_ptr<functions::GPT2BPEEncoder> {
+            return functions::_deserialize_gpt2_bpe_encoder_pybind(states);
+          }));
 #endif
 }
 

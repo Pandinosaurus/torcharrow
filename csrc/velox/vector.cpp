@@ -1,4 +1,11 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #include "vector.h"
 #include <velox/common/memory/Memory.h>
 #include <velox/type/Type.h>
@@ -22,7 +29,8 @@ velox::VectorPtr
 arrayVectorSlice(const velox::ArrayVector& src, int start, int end) {
   auto length = end - start;
   std::shared_ptr<const velox::Type> elementType = src.type();
-  auto result = velox::BaseVector::create(ARRAY(elementType), length, src.pool());
+  auto result =
+      velox::BaseVector::create(ARRAY(elementType), length, src.pool());
   auto ptr = result.get()->as<velox::ArrayVector>();
   if (length > 0) {
     ptr->setElements(vectorSlice(

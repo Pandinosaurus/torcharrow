@@ -1,8 +1,13 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import functools
-from typing import List, Tuple, Type, Optional
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-from .expression import Expression, Call, Var, GetAttr
+import functools
+from typing import List, Optional, Tuple, Type
+
+from .expression import Call, Expression, GetAttr, Var
 
 # -----------------------------------------------------------------------------
 # Trace state (part of a scope object)
@@ -76,7 +81,7 @@ class Trace:
 # function decorator
 
 
-def get_trace(*args, **kwargs):
+def get_trace(*args, **kwargs) -> Trace:
     from .scope import Scope
 
     return Scope.default.trace
@@ -132,9 +137,9 @@ def traceproperty(fn):
         # # same code as above, except for this line...
         # fn._is_property = True
         # #find the scope::
-        # # at least one positional argument must be an IColumn
+        # # at least one positional argument must be an Column
         # for arg in args:
-        #     if isinstance(arg,IColumn):
+        #     if isinstance(arg,Column):
         #         scope = arg.scope
 
         # # existing functions

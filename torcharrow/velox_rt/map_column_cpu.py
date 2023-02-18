@@ -1,7 +1,10 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import array as ar
-import copy
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List
 
@@ -11,23 +14,23 @@ import torcharrow._torcharrow as velox
 import torcharrow.dtypes as dt
 import torcharrow.pytorch as pytorch
 from tabulate import tabulate
-from torcharrow import Scope
+from torcharrow import functional
 from torcharrow.dispatcher import Dispatcher
-from torcharrow.dispatcher import Dispatcher
-from torcharrow.icolumn import IColumn
-from torcharrow.imap_column import IMapColumn, IMapMethods
+from torcharrow.icolumn import Column
+from torcharrow.imap_column import MapColumn, MapMethods
+from torcharrow.scope import Scope
 
-from .column import ColumnFromVelox
+from .column import ColumnCpuMixin
 from .typing import get_velox_type
 
 # -----------------------------------------------------------------------------
-# IMapColumn
+# MapColumn
 
 
-class MapColumnCpu(ColumnFromVelox, IMapColumn):
+class MapColumnCpu(ColumnCpuMixin, MapColumn):
     def __init__(self, device, dtype, key_data, item_data, mask):
         assert dt.is_map(dtype)
-        IMapColumn.__init__(self, device, dtype)
+        MapColumn.__init__(self, device, dtype)
 
         self._data = velox.Column(
             velox.VeloxMapType(
@@ -35,9 +38,23 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
             )
         )
 
-        self._finialized = False
+        self._finalized = False
 
         self.maps = MapMethodsCpu(self)
+
+    # Override ColumCpuMixin optimized implementation of _slice to use the
+    # basic Column implementation, as the fast version doesn't work yet or map.
+    # See https://github.com/facebookresearch/torcharrow/issues/62.
+    # TODO: remove this once `to_arrow` works on Map.
+    def _gets(self, indices):
+        return Column._gets(self, indices)
+
+    # Override ColumCpuMixin optimized implementation of _slice to use the
+    # basic Column implementation, as the fast version doesn't work yet or map.
+    # See https://github.com/facebookresearch/torcharrow/issues/62.
+    # TODO: remove this once `to_arrow` works on Map.
+    def _slice(self, start, stop, step):
+        return Column._slice(self, start, stop, step)
 
     # Lifecycle: _empty -> _append* -> _finalize; no other ops are allowed during this time
 
@@ -55,8 +72,8 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
     def _full(device, data, dtype=None, mask=None):
         assert isinstance(data, tuple) and len(data) == 2
         key_data, item_data = data
-        assert isinstance(key_data, IColumn)
-        assert isinstance(item_data, IColumn)
+        assert isinstance(key_data, Column)
+        assert isinstance(item_data, Column)
         assert len(item_data) == len(key_data)
 
         if dtype is None:
@@ -72,7 +89,7 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         if not dt.is_map(dtype):
             raise TypeError(f"construction of columns of type {dtype} not supported")
         if mask is None:
-            mask = IMapColumn._valid_mask(len(key_data))
+            mask = MapColumn._valid_mask(len(key_data))
         elif len(key_data) != len(mask):
             raise ValueError(
                 f"data length {len(key_data)} must be the same as mask length {len(mask)}"
@@ -81,7 +98,7 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         return MapColumnCpu(device, dtype, key_data, item_data, mask)
 
     @staticmethod
-    def _fromlist(device, data: List, dtype):
+    def _from_pysequence(device, data: List, dtype: dt.List):
         # default implementation
         col = MapColumnCpu._empty(device, dtype)
         for i in data:
@@ -89,24 +106,24 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         return col._finalize()
 
     def _append_null(self):
-        if self._finialized:
-            raise AttributeError("It is already finialized.")
+        if self._finalized:
+            raise AttributeError("It is already finalized.")
         self._data.append_null()
 
     def _append_value(self, value):
-        if self._finialized:
-            raise AttributeError("It is already finialized.")
+        if self._finalized:
+            raise AttributeError("It is already finalized.")
         elif value is None:
             self._data.append_null()
         else:
-            new_key = ta.Column(self._dtype.key_dtype)
-            new_value = ta.Column(self._dtype.item_dtype)
+            new_key = ta.column(self._dtype.key_dtype)
+            new_value = ta.column(self._dtype.item_dtype)
             new_key = new_key.append(value.keys())
             new_value = new_value.append(value.values())
             self._data.append(new_key._data, new_value._data)
 
     def _finalize(self, mask=None):
-        self._finialized = True
+        self._finalized = True
         return self
 
     def __len__(self):
@@ -127,13 +144,13 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         if self._data.is_null_at(i):
             return self.dtype.default_value()
         else:
-            key_col = ColumnFromVelox.from_velox(
+            key_col = ColumnCpuMixin._from_velox(
                 self.device,
                 self._dtype.key_dtype,
                 self._data.keys()[i],
                 True,
             )
-            value_col = ColumnFromVelox.from_velox(
+            value_col = ColumnCpuMixin._from_velox(
                 self.device,
                 self._dtype.item_dtype,
                 self._data.values()[i],
@@ -160,7 +177,7 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         return tab + dt.NL + typ
 
     # interop
-    def to_torch(self):
+    def _to_tensor_default(self):
         pytorch.ensure_available()
         import torch
 
@@ -169,12 +186,12 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
         # FIXME: https://github.com/facebookresearch/torcharrow/issues/62 to_arrow doesn't work as expected for map
         # arrow_array = self.to_arrow()
 
-        keys = ColumnFromVelox.from_velox(
+        keys = ColumnCpuMixin._from_velox(
             self.device, dt.List(self._dtype.key_dtype), self._data.keys(), True
-        ).to_torch(_propagate_py_list=False)
-        values = ColumnFromVelox.from_velox(
+        )._to_tensor_default(_propagate_py_list=False)
+        values = ColumnCpuMixin._from_velox(
             self.device, dt.List(self._dtype.item_dtype), self._data.values(), True
-        ).to_torch(_propagate_py_list=False)
+        )._to_tensor_default(_propagate_py_list=False)
 
         # TODO: should we propagate python list if both keys and vals are lists of strings?
         assert isinstance(keys, pytorch.PackedList)
@@ -199,26 +216,26 @@ class MapColumnCpu(ColumnFromVelox, IMapColumn):
 # registering the factory
 Dispatcher.register((dt.Map.typecode + "_empty", "cpu"), MapColumnCpu._empty)
 Dispatcher.register((dt.Map.typecode + "_full", "cpu"), MapColumnCpu._full)
-Dispatcher.register((dt.Map.typecode + "_fromlist", "cpu"), MapColumnCpu._fromlist)
+Dispatcher.register(
+    (dt.Map.typecode + "_from_pysequence", "cpu"), MapColumnCpu._from_pysequence
+)
 # -----------------------------------------------------------------------------
 # MapMethods
 
 
 @dataclass
-class MapMethodsCpu(IMapMethods):
-    """Vectorized list functions for IListColumn"""
+class MapMethodsCpu(MapMethods):
+    """Vectorized list functions for ListColumn"""
 
     def __init__(self, parent: MapColumnCpu):
         super().__init__(parent)
 
     def keys(self):
+        # Delegate to `map_keys` function
         me = self._parent
-        return ColumnFromVelox.from_velox(
-            me.device, dt.List(me._dtype.key_dtype), me._data.keys(), True
-        )
+        return functional.map_keys(me)._with_null(me._dtype.nullable)
 
     def values(self):
+        # Delegate to `map_values` function
         me = self._parent
-        return ColumnFromVelox.from_velox(
-            me.device, dt.List(me._dtype.item_dtype), me._data.values(), True
-        )
+        return functional.map_values(me)._with_null(me._dtype.nullable)

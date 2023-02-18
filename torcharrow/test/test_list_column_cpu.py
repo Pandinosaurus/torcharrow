@@ -1,9 +1,10 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import operator
-import unittest
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-import torcharrow.dtypes as dt
-from torcharrow import IListColumn, INumericalColumn, Scope
+import unittest
 
 from .test_list_column import TestListColumn
 
@@ -17,6 +18,9 @@ class TestListColumnCpu(TestListColumn):
 
     def test_nonempty(self):
         self.base_test_nonempty()
+
+    def test_list_with_none(self):
+        self.base_test_list_with_none()
 
     def test_append_concat(self):
         return self.base_test_append_concat()
@@ -38,6 +42,12 @@ class TestListColumnCpu(TestListColumn):
 
     def test_map_reduce_etc(self):
         self.base_test_map_reduce_etc()
+
+    def test_fixed_size_list(self):
+        self.base_test_fixed_size_list()
+
+    def test_cast(self):
+        self.base_test_cast()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,19 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import operator
 import unittest
 
 import torcharrow as ta
 import torcharrow.dtypes as dt
-from torcharrow import IColumn, Scope, me, trace, GroupedDataFrame
+from torcharrow import me
+from torcharrow.icolumn import Column
+from torcharrow.scope import Scope
+from torcharrow.trace import trace
+from torcharrow.velox_rt.dataframe_cpu import GroupedDataFrame
 
 # -----------------------------------------------------------------------------
 # testdata
@@ -109,11 +118,11 @@ class TestDFWithTrace(unittest.TestCase):
 # aux: global function --------------------------------------------------------
 
 
-def h(x):
+def h(x) -> int:
     return 133 if x == 13 else x
 
 
-def cmds(stms):
+def cmds(stms) -> str:
     quote = lambda x: f'"{x}"' if "'" in x else f"'{x}'"
     res = []
     for stm in stms:
@@ -129,12 +138,12 @@ class TestColumnTrace(unittest.TestCase):
         Scope.default = Scope(
             {
                 "tracing": True,
-                "types_to_trace": [Scope, IColumn],
+                "types_to_trace": [Scope, Column],
             }
         )
 
     def test_columns(self):
-        c0 = ta.Column(dt.int64)
+        c0 = ta.column(dt.int64)
         c0 = c0.append([13])
         t = c0.dtype
         c0 = c0.append([14])
@@ -155,7 +164,7 @@ class TestColumnTrace(unittest.TestCase):
         c3 = c1[[0, 1]]
 
         # NOTE can't be traced...
-        b = ta.Column([True] * len(c3))
+        b = ta.column([True] * len(c3))
         # ... rewrite to
         b = c1 != c1
 
@@ -177,20 +186,20 @@ class TestColumnTrace(unittest.TestCase):
         # print("TRACE", cmds(Scope.default.trace.statements()))
         verdict = [
             "c0 = torcharrow.scope.Scope._Column(int64, dtype=None, device='cpu')",
-            "c1 = torcharrow.icolumn.IColumn.append(c0, [13])",
-            "c2 = torcharrow.icolumn.IColumn.append(c1, [14])",
-            "c3 = torcharrow.icolumn.IColumn.append(c2, [16, 19])",
-            "_ = torcharrow.icolumn.IColumn.__getitem__(c3, 0)",
-            "c4 = torcharrow.icolumn.IColumn.__getitem__(c3, slice(None, 1, None))",
-            "c5 = torcharrow.icolumn.IColumn.__getitem__(c3, [0, 1])",
+            "c1 = torcharrow.icolumn.Column.append(c0, [13])",
+            "c2 = torcharrow.icolumn.Column.append(c1, [14])",
+            "c3 = torcharrow.icolumn.Column.append(c2, [16, 19])",
+            "_ = torcharrow.icolumn.Column.__getitem__(c3, 0)",
+            "c4 = torcharrow.icolumn.Column.__getitem__(c3, slice(None, 1, None))",
+            "c5 = torcharrow.icolumn.Column.__getitem__(c3, [0, 1])",
             "c6 = torcharrow.scope.Scope._Column([True, True], dtype=None, device='cpu')",
             "c7 = torcharrow.velox_rt.numerical_column_cpu.NumericalColumnCpu.__ne__(c3, c3)",
-            "c8 = torcharrow.icolumn.IColumn.__getitem__(c3, c7)",
-            "c9 = torcharrow.icolumn.IColumn.head(c3, 17)",
-            "c10 = torcharrow.icolumn.IColumn.tail(c5, -12)",
-            "c11 = torcharrow.icolumn.IColumn.map(c3, {13: 133}, dtype=Int64(nullable=True))",
-            "c12 = torcharrow.icolumn.IColumn.map(c3, h)",
-            "_ = torcharrow.icolumn.IColumn.reduce(c3, operator.add, 0)",
+            "c8 = torcharrow.icolumn.Column.__getitem__(c3, c7)",
+            "c9 = torcharrow.icolumn.Column.head(c3, 17)",
+            "c10 = torcharrow.icolumn.Column.tail(c5, -12)",
+            "c11 = torcharrow.icolumn.Column.map(c3, {13: 133}, dtype=Int64(nullable=True))",
+            "c12 = torcharrow.icolumn.Column.map(c3, h)",
+            "_ = torcharrow.icolumn.Column.reduce(c3, operator.add, 0)",
             "c13 = torcharrow.velox_rt.numerical_column_cpu.NumericalColumnCpu.sort(c3, ascending=False)",
         ]
 
@@ -210,12 +219,12 @@ def add(tup):
 
 class TestDataframeTrace(unittest.TestCase):
     def setUp(self):
-        types = [Scope, IColumn, GroupedDataFrame]
+        types = [Scope, Column, GroupedDataFrame]
         Scope.default = Scope({"tracing": True, "types_to_trace": types})
 
     def test_simple_df_ops_fail(self):
 
-        df = ta.DataFrame()
+        df = ta.dataframe()
         df["a"] = [1, 2, 3]
         df["b"] = [11, 22, 33]
         df["c"] = [111, 222, 333]
@@ -224,7 +233,7 @@ class TestDataframeTrace(unittest.TestCase):
         df["d"] = c1
 
         d1 = df.drop(["a"])
-        d2 = df.keep(["a", "c"])
+        d2 = df[["a", "c"]]
         # TODO Clarify: Why did we have in 0.2 this as an  self.assertRaises(AttributeError):
         # AttributeError: cannot override existing column d
         # simply overrides the column name, but that's ok...
@@ -233,7 +242,7 @@ class TestDataframeTrace(unittest.TestCase):
         self.assertTrue(True)
 
     def test_simple_df_ops_succeed(self):
-        df = ta.DataFrame()
+        df = ta.dataframe()
         df["a"] = [1, 2, 3]
         df["b"] = [11, 22, 33]
         df["c"] = [111, 222, 333]
@@ -242,7 +251,7 @@ class TestDataframeTrace(unittest.TestCase):
         df["d"] = c1
 
         d1 = df.drop(["a"])
-        d2 = df.keep(["a", "c"])
+        d2 = df[["a", "c"]]
         d3 = d2.rename({"c": "e"})
 
         d4 = d3.min()
@@ -250,13 +259,13 @@ class TestDataframeTrace(unittest.TestCase):
         # print("TRACE", cmds(Scope.default.trace.statements()))
         verdict = [
             "c0 = torcharrow.scope.Scope._DataFrame(None, dtype=None, columns=None, device='cpu')",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'a', [1, 2, 3])",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'b', [11, 22, 33])",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'c', [111, 222, 333])",
-            "c4 = torcharrow.icolumn.IColumn.__getitem__(c0, 'a')",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'd', c4)",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'a', [1, 2, 3])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'b', [11, 22, 33])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'c', [111, 222, 333])",
+            "c4 = torcharrow.icolumn.Column.__getitem__(c0, 'a')",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'd', c4)",
             "c11 = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.drop(c0, ['a'])",
-            "c16 = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.keep(c0, ['a', 'c'])",
+            "c16 = torcharrow.icolumn.Column.__getitem__(c0, ['a', 'c'])",
             "c21 = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.rename(c16, {'c': 'e'})",
             "c24 = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.min(c21)",
         ]
@@ -264,7 +273,7 @@ class TestDataframeTrace(unittest.TestCase):
         self.assertEqual(Scope.default.trace.statements(), verdict)
 
     def test_df_trace_equivalence(self):
-        df = ta.DataFrame()
+        df = ta.dataframe()
         # print("TRACE", cmds(Scope.default.trace.statements()))
         self.assertEqual(
             Scope.default.trace.statements(),
@@ -276,7 +285,7 @@ class TestDataframeTrace(unittest.TestCase):
         df["a"] = [1, 2, 3]
         self.assertEqual(
             Scope.default.trace.statements()[-1],
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'a', [1, 2, 3])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'a', [1, 2, 3])",
         )
 
         df["b"] = [11, 22, 33]
@@ -286,9 +295,9 @@ class TestDataframeTrace(unittest.TestCase):
         # print("TRACE", cmds(Scope.default.trace.statements()))
         verdict = [
             "c0 = torcharrow.scope.Scope._DataFrame(None, dtype=None, columns=None, device='cpu')",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'a', [1, 2, 3])",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'b', [11, 22, 33])",
-            "_ = torcharrow.idataframe.IDataFrame.__setitem__(c0, 'c', [111, 222, 333])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'a', [1, 2, 3])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'b', [11, 22, 33])",
+            "_ = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.__setitem__(c0, 'c', [111, 222, 333])",
             "c9 = torcharrow.velox_rt.dataframe_cpu.DataFrameCpu.where(c0, torcharrow.idataframe.me.__getitem__('a').__gt__(1))",
         ]
 
@@ -308,7 +317,7 @@ class TestDataframeTrace(unittest.TestCase):
         self.assertEqual(list(d11), list(eval(result)))
 
     def test_df_trace_locals_and_me_equivalence(self):
-        d0 = ta.DataFrame({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
+        d0 = ta.dataframe({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
 
         d1 = d0.where((d0["a"] > 1))
         d1_result = Scope.default.trace.result()
@@ -329,7 +338,7 @@ class TestDataframeTrace(unittest.TestCase):
         # self.assertEqual(list(eval(d1_result)), list(eval(d2_result)))
 
     def test_df_trace_select_with_map(self):
-        d0 = ta.DataFrame({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
+        d0 = ta.dataframe({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
         d2 = d0.select(f=me.map(add, dtype=dt.int64))
 
         d2_result = Scope.default.trace.result()
@@ -344,7 +353,7 @@ class TestDataframeTrace(unittest.TestCase):
         # self.assertEqual(list(d2), list(eval(d2_result)))
 
     def test_df_trace_select_map_equivalence(self):
-        d0 = ta.DataFrame({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
+        d0 = ta.dataframe({"a": [1, 2, 3], "b": [11, 22, 33], "c": [111, 222, 333]})
 
         d1 = d0.select("*", e=me["a"] + me["b"])
         d1_result = Scope.default.trace.result()
@@ -362,9 +371,8 @@ class TestDataframeTrace(unittest.TestCase):
         # exec(";".join(stms))
         # self.assertEqual(list(eval(d1_result)), list(eval(d2_result)))
 
-    @unittest.skip("fix https://github.com/facebookresearch/torcharrow/issues/35")
     def test_df_without_input(self):
-        d0 = ta.DataFrame(
+        d0 = ta.dataframe(
             dtype=dt.Struct([dt.Field(i, dt.int64) for i in ["a", "b", "c"]])
         )
 
@@ -377,7 +385,7 @@ class TestDataframeTrace(unittest.TestCase):
         stms = Scope.default.trace.statements()
 
         import torcharrow
-        from torcharrow.dtypes import Struct, Field, int64
+        from torcharrow.dtypes import Field, int64, Struct
 
         # TODO: fix this
         # s0 = Scope.default

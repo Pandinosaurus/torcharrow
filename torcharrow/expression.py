@@ -1,4 +1,9 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import operator
 from abc import ABC
 from keyword import iskeyword
@@ -71,7 +76,7 @@ class GetAttr(Expression):
         return f"{self._obj}.{self._name}"
 
 
-def _dummy_function():
+def _dummy_function() -> None:
     pass
 
 

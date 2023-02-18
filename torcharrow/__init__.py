@@ -1,32 +1,40 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-# For relative imports to work in Python 3.6
-from .expression import *  # dependencies: None
-from .trace import *  # dependencies: expression
-
-# don't include
-# from .dtypes import *
-# since dtypes define Tuple and List which confuse mypy
-
-from .scope import *  # dependencies: column_factory, dtypes
-
-# following needs scope*
-from .icolumn import Column, concat, if_else  # noqa
-from .inumerical_column import *
-from .istring_column import *
-from .ilist_column import *
-from .imap_column import *
-from .idataframe import *
-
-from .velox_rt import *
-
-from . import pytorch
-from .interop import from_pylist
+from . import pytorch, velox_rt  # noqa  # noqa
+from .icolumn import Column, column, concat, if_else  # noqa
+from .idataframe import DataFrame, dataframe, me  # noqa
+from .ilist_column import ListColumn  # noqa
+from .imap_column import MapColumn  # noqa
+from .interop import from_arrow, from_pysequence  # noqa
+from .inumerical_column import NumericalColumn  # noqa
+from .istring_column import StringColumn  # noqa
 
 try:
+    # pyre-fixme[21]: Could not find module `torcharrow.version`.
     from .version import __version__  # noqa: F401
 except ImportError:
     pass
+
+__all__ = [
+    "dataframe",
+    "column",
+    "concat",
+    "if_else",
+    "from_arrow",
+    "from_pysequence",
+    "me",
+    "functional",
+    "DataFrame",
+    "Column",
+    "NumericalColumn",
+    "StringColumn",
+    "ListColumn",
+    "MapColumn",
+]
 
 # module level doc-string
 __doc__ = """
@@ -46,7 +54,7 @@ integrates well with PyTorch data-wrangling workflows.
 Examples
 --------
 >>> import torcharrow as ta
->>> df = ta.DataFrame({'a':[1,2,3], 'b':[4,None,6]})
+>>> df = ta.dataframe({'a':[1,2,3], 'b':[4,None,6]})
 >>> df['a'] + df['b']
 0  5
 1  None

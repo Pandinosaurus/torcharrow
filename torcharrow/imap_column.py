@@ -1,32 +1,37 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import abc
 from dataclasses import dataclass
 
 import torcharrow.dtypes as dt
 
-from .icolumn import IColumn
+from .icolumn import Column
 
 # -----------------------------------------------------------------------------
-# IMapColumn
+# MapColumn
 
 
-class IMapColumn(IColumn):
+class MapColumn(Column):
     def __init__(self, device, dtype):
         assert dt.is_map(dtype)
         super().__init__(device, dtype)
         # must be set by subclasses
-        self.maps: IMapMethods = None
+        self.maps: MapMethods = None
 
 
 # -----------------------------------------------------------------------------
 # MapMethods
 
 
-class IMapMethods(abc.ABC):
-    """Vectorized list functions for IListColumn"""
+class MapMethods(abc.ABC):
+    """Vectorized list functions for ListColumn"""
 
     def __init__(self, parent):
-        self._parent: IMapColumn = parent
+        self._parent: MapColumn = parent
 
     @abc.abstractmethod
     def keys(self):
@@ -40,7 +45,7 @@ class IMapMethods(abc.ABC):
         Examples
         --------
         >>> import torcharrow as ta
-        >>> mf = ta.Column([
+        >>> mf = ta.column([
         >>>  {'helsinki': [-1.3, 21.5], 'moscow': [-4.0,24.3]},
         >>>  {'algiers':[11.2, 25.2], 'kinshasa':[22.2,26.8]}
         >>>  ])
@@ -63,7 +68,7 @@ class IMapMethods(abc.ABC):
         Examples
         --------
         >>> import torcharrow as ta
-        >>> mf = ta.Column([
+        >>> mf = ta.column([
         >>>  {'helsinki': [-1.3, 21.5], 'moscow': [-4.0,24.3]},
         >>>  {'algiers':[11.2, 25.2], 'kinshasa':[22.2,26.8]}
         >>>  ])
@@ -75,6 +80,8 @@ class IMapMethods(abc.ABC):
         pass
 
     def get(self, i, fill_value):
+        self._parent._prototype_support_warning("maps.get")
+
         me = self._parent
 
         def fun(xs):

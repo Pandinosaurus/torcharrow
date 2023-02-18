@@ -1,5 +1,10 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-from typing import List, Optional, cast
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from typing import cast, List, Optional
 
 # Skipping analyzing 'numpy': found module but no type hints or library stubs
 import numpy as np  # type: ignore
@@ -9,44 +14,7 @@ import numpy.ma as ma  # type: ignore
 import pandas as pd  # type: ignore
 import pyarrow as pa  # type: ignore
 import torcharrow.dtypes as dt
-from torcharrow import Scope
-
-
-def from_arrow_table(
-    table,
-    dtype: Optional[dt.DType] = None,
-    columns: Optional[List[str]] = None,
-    scope=None,
-    device="",
-):
-    """ "
-    Convert arrow table to a torcharrow dataframe.
-    """
-    scope = scope or Scope.default
-    device = device or scope.device
-    assert isinstance(table, pa.Table)
-    if dtype is not None:
-        assert dt.is_struct(dtype)
-        dtype = cast(dt.Struct, dtype)
-        res = {}
-        for f in dtype.fields:
-            chunked_array = table.column(f.name)
-            pydata = chunked_array.to_pylist()
-            res[f.name] = scope.Column(pydata, f.dtype)
-        return scope.DataFrame(res, device=device)
-    else:
-        res = {}
-        table = table.select(columns) if columns is not None else table
-        for n in table.column_names:
-            chunked_array = table.column(n)
-            pydata = chunked_array.to_pylist()
-            res[n] = scope.Column(
-                pydata,
-                dtype=_arrowtype_to_dtype(
-                    table.schema.field(n).type, table.column(n).null_count > 0
-                ),
-            )
-        return scope.DataFrame(res, device=device)
+from torcharrow.scope import Scope
 
 
 def from_pandas_dataframe(
@@ -54,7 +22,7 @@ def from_pandas_dataframe(
     dtype: Optional[dt.DType] = None,
     columns: Optional[List[str]] = None,
     scope=None,
-    device="",
+    device: str = "",
 ):
     """
     Convert pandas dataframe to torcharrow dataframe (drops indices).
@@ -112,26 +80,7 @@ def from_pandas_dataframe(
         return scope.Frame(res, device=device)
 
 
-def from_arrow_array(array, dtype=None, scope=None, device=""):
-    """
-    Convert arrow array to a torcharrow column.
-    """
-    scope = scope or Scope.default
-    device = device or scope.device
-    assert isinstance(array, pa.Array)
-    pydata = _arrow_scalar_to_py(array)
-    if dtype is not None:
-        assert not dt.is_struct(dtype)
-        return scope.Column(pydata, dtype, device=device)
-    else:
-        return scope.Column(
-            pydata,
-            dtype=_arrowtype_to_dtype(array.type, array.null_count > 0),
-            device=device,
-        )
-
-
-def from_pandas_series(series, dtype=None, scope=None, device=""):
+def from_pandas_series(series, dtype=None, scope=None, device: str = ""):
     """ "
     Convert pandas series array to a torcharrow column (drops indices).
     """
@@ -141,7 +90,7 @@ def from_pandas_series(series, dtype=None, scope=None, device=""):
     return from_numpy(series.to_numpy(), dtype, scope, device)
 
 
-def from_numpy(array, dtype, scope=None, device=""):
+def from_numpy(array, dtype, scope=None, device: str = ""):
     """
     Convert 1dim numpy array to a torcharrow column (zero copy).
     """
@@ -156,15 +105,16 @@ def from_numpy(array, dtype, scope=None, device=""):
         raise TypeError(f"cannot convert numpy array of type {array.dtype}")
 
 
-def _is_not_str(s):
+def _is_not_str(s) -> bool:
     return not isinstance(s, str)
 
 
-def _from_numpy_ma(data, mask, dtype, scope=None, device=""):
+def _from_numpy_ma(data, mask, dtype, scope=None, device: str = ""):
     # adopt types
     if dtype is None:
         dtype = dt.typeof_np_dtype(data.dtype).with_null()
     else:
+        # pyre-fixme[16]: Module `dtypes` has no attribute `is_primitive_type`.
         assert dt.is_primitive_type(dtype)
         assert dtype == dt.typeof_np_dtype(data.dtype).with_null()
         # TODO if not, adopt the type or?
@@ -184,7 +134,7 @@ def _from_numpy_ma(data, mask, dtype, scope=None, device=""):
         raise TypeError(f"cannot convert masked numpy array of type {data.dtype}")
 
 
-def _from_numpy_nd(data, dtype, scope=None, device=""):
+def _from_numpy_nd(data, dtype, scope=None, device: str = ""):
     # adopt types
     if dtype is None:
         dtype = dt.typeof_np_dtype(data.dtype)
@@ -229,7 +179,7 @@ def _pandatype_to_dtype(t, nullable):
     return dt.typeof_nptype(t, nullable)
 
 
-def _arrowtype_to_dtype(t, nullable):
+def _arrowtype_to_dtype(t: pa.DataType, nullable: bool) -> dt.DType:
     if pa.types.is_boolean(t):
         return dt.Boolean(nullable)
     if pa.types.is_int8(t):
@@ -244,14 +194,42 @@ def _arrowtype_to_dtype(t, nullable):
         return dt.Float32(nullable)
     if pa.types.is_float64(t):
         return dt.Float64(nullable)
-    if pa.types.is_list(t):
-        return List(t.value_type, nullable)
-    if pa.types.is_struct(t):
-        return _pandatype_to_dtype(t.to_pandas_dtype(), True)
-    if pa.types.is_null(t):
-        return dt.Void()
-    if pa.types.is_string(t):
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
         return dt.String(nullable)
-    if pa.types.is_map(t):
-        return dt.Map(t.item_type, t.key_type, nullable)
-    raise NotImplementedError("unsupported case")
+    if pa.types.is_struct(t):
+        return dt.Struct(
+            # pyre-fixme[16]: `DataType` has no attribute `__iter__`.
+            [dt.Field(f.name, _arrowtype_to_dtype(f.type, f.nullable)) for f in t],
+            nullable,
+        )
+    raise NotImplementedError(f"Unsupported Arrow type: {str(t)}")
+
+
+def _dtype_to_arrowtype(t: dt.DType) -> pa.DataType:
+    underlying_dtype = dt.get_underlying_dtype(t)
+    if underlying_dtype == dt.boolean:
+        return pa.bool_()
+    elif underlying_dtype == dt.int8:
+        return pa.int8()
+    elif underlying_dtype == dt.int16:
+        return pa.int16()
+    elif underlying_dtype == dt.int32:
+        return pa.int32()
+    elif underlying_dtype == dt.int64:
+        return pa.int64()
+    elif underlying_dtype == dt.float32:
+        return pa.float32()
+    elif underlying_dtype == dt.float64:
+        return pa.float64()
+    elif underlying_dtype == dt.string:
+        return pa.string()
+    elif dt.is_struct(underlying_dtype):
+        return pa.struct(
+            [
+                pa.field(
+                    f.name, _dtype_to_arrowtype(f.dtype), nullable=f.dtype.nullable
+                )
+                for f in cast(dt.Struct, t).fields
+            ]
+        )
+    raise NotImplementedError(f"Unsupported DType to Arrow type: {str(t)}")

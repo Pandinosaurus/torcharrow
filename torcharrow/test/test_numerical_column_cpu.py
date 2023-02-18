@@ -1,9 +1,10 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import unittest
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-import torcharrow.dtypes as dt
-from torcharrow import INumericalColumn
-from torcharrow import Scope
+import unittest
 
 from .test_numerical_column import TestNumericalColumn
 
@@ -52,6 +53,9 @@ class TestNumericalColumnCpu(TestNumericalColumn):
     def test_na_handling(self):
         return self.base_test_na_handling()
 
+    def test_fill_null_type_promotion_rules(self):
+        return self.base_test_fill_null_type_promotion_rules()
+
     def test_agg_handling(self):
         return self.base_test_agg_handling()
 
@@ -64,8 +68,32 @@ class TestNumericalColumnCpu(TestNumericalColumn):
     def test_describe(self):
         return self.base_test_describe()
 
+    def test_column_from_tuple(self):
+        return self.base_test_column_from_tuple()
+
+    def test_column_from_numpy_array(self):
+        return self.base_test_column_from_numpy_array()
+
+    def test_append_automatic_conversions(self):
+        return self.base_test_append_automatic_conversions()
+
     def test_batch_collate(self):
         return self.base_test_batch_collate()
+
+    def test_cast(self):
+        return self.base_test_cast()
+
+    def test_str(self):
+        self.base_test_str()
+
+    def test_repr(self):
+        self.base_test_repr()
+
+    def test_to_pandas(self):
+        self.base_test_to_pandas()
+
+    def test_transform(self):
+        self.base_test_transform()
 
 
 if __name__ == "__main__":

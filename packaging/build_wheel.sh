@@ -1,5 +1,9 @@
 #!/bin/bash
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 # Reference:
 # * https://github.com/pytorch/audio/blob/392a03c86d94d2747e1a0fc270a74c3845535173/packaging/build_wheel.sh
@@ -29,35 +33,35 @@ setup_build_version() {
 # Set some useful variables for OS X, if applicable
 setup_macos() {
   if [[ "$(uname)" == Darwin ]]; then
-    export CC=clang CXX=clang++
+    export MACOSX_DEPLOYMENT_TARGET=10.15 CC=clang CXX=clang++
   fi
 }
 
 # Inputs:
-#   PYTHON_VERSION (3.8, 3.9)
+#   PYTHON_VERSION (3.7, 3.8, 3.9)
 #
 # Outputs:
 #   PATH modified to put correct Python version in PATH
 setup_wheel_python() {
-  if [[ "$(uname)" == Darwin || "$OSTYPE" == "msys" ]]; then
-    eval "$(conda shell.bash hook)"
-    conda env remove -n "env$PYTHON_VERSION" || true
-    conda create -yn "env$PYTHON_VERSION" python="$PYTHON_VERSION"
-    conda activate "env$PYTHON_VERSION"
-  else
-    echo "Unsupported"
-    exit 1
-  fi
+  if [[ -n "$PYTHON_VERSION" ]]; then
+      eval "$(conda shell.bash hook)"
+      conda env remove -n "env$PYTHON_VERSION" || true
+      conda create -yn "env$PYTHON_VERSION" python="$PYTHON_VERSION"
+      conda activate "env$PYTHON_VERSION"
+ fi
+
 }
 
-setup_build_version 0.0.2
+version=$(cat "version.txt")
+setup_build_version "$version"
 setup_wheel_python
 python setup.py clean
 if [[ "$(uname)" == Darwin ]]; then
-    setup_macos
-    python setup.py bdist_wheel
+  setup_macos
+  python setup.py bdist_wheel
+elif [[ "$(uname)" == Linux ]]; then
+  python setup.py bdist_wheel
 else
-    echo "Unsupported"
-    exit 1
+  echo "Unsupported"
+  exit 1
 fi
-

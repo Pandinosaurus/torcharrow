@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from typing import Union, List, Any
+from typing import Any, List, Union
 
-# @manual=//pytorch/torcharrow/csrc/velox:_torcharrow
-import torcharrow._torcharrow as ta
+import pyarrow as pa  # @manual=@/third-party:apache-arrow:apache-arrow-py
+
+# when _torcharrow is built with torch, we need to import torcharrow._torcharrow after
+# importing torch to avoid running into the following error:
+# https://github.com/pytorch/extension-cpp/issues/6#issuecomment-640191103
+import torcharrow.test.test_utils  # noqa
+import torcharrow._torcharrow as ta  # isort:skip
+from pyarrow.cffi import ffi  # @manual=@/third-party:python-cffi:python-cffi-py
 
 
 class BaseTestColumns(unittest.TestCase):
-    def assert_Column(self, col: ta.BaseColumn, val: List[Any]):
+    # pyre-fixme[11]: Annotation `BaseColumn` is not defined as a type.
+    def assert_Column(self, col: ta.BaseColumn, val: List[Any]) -> None:
         self.assertEqual(len(col), len(val))
         self.assertEqual(col.get_null_count(), sum(x is None for x in val))
         for i in range(len(val)):
@@ -28,7 +40,7 @@ class BaseTestColumns(unittest.TestCase):
 
 
 class TestSimpleColumns(BaseTestColumns):
-    def test_SimpleColumnInt64(self):
+    def test_SimpleColumnInt64(self) -> None:
         data = [1, 2, None, 3, 4, None]
         col = infer_column(data)
 
@@ -61,7 +73,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertEqual(sliced_col[2], 3)
         self.assertEqual(sliced_col.get_null_count(), 1)
 
-    def test_SimpleColumnInt64_unary(self):
+    def test_SimpleColumnInt64_unary(self) -> None:
         data = [1, -2, None, 3, -4, None]
         col = infer_column(data)
         self.assertEqual(col.type().kind(), ta.TypeKind.BIGINT)
@@ -82,7 +94,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assert_Column(abs_col, [1, 2, None, 3, 4, None])
         self.assertEqual(abs_col.type().kind(), ta.TypeKind.BIGINT)
 
-    def test_SimpleColumnInt64_binary(self):
+    def test_SimpleColumnInt64_binary(self) -> None:
         data1 = [1, -2, None, 3, -4, None]
         col1 = infer_column(data1)
         data2 = [None, 1, 2, 3, 4, 5]
@@ -161,18 +173,15 @@ class TestSimpleColumns(BaseTestColumns):
 
         mod_scalar = col1.mod(3)
         self.assertEqual(mod_scalar.type().kind(), ta.TypeKind.BIGINT)
-        # Python's behavior for modulo on negative numbers is different from
-        # Velox/C++. e.g. -2 % 3 = 1 (because integer division in Python is
-        # floor(a/b), as opposed to trunc(a/b))
-        self.assert_Column(mod_scalar, [1, -2, None, 0, -1, None])
+        self.assert_Column(mod_scalar, [1, 1, None, 0, 2, None])
 
         mod_scalar = col1.mod(-3.0)
         self.assertEqual(mod_scalar.type().kind(), ta.TypeKind.REAL)
-        self.assert_Column(mod_scalar, [1.0, -2.0, None, 0.0, -1.0, None])
+        self.assert_Column(mod_scalar, [-2.0, -2.0, None, 0.0, -1.0, None])
 
         mod_scalar = col1.rmod(3)
         self.assertEqual(mod_scalar.type().kind(), ta.TypeKind.BIGINT)
-        self.assert_Column(mod_scalar, [0, 1, None, 0, 3, None])
+        self.assert_Column(mod_scalar, [0, -1, None, 0, -1, None])
 
         mod_scalar = col1.rmod(-3.0)
         self.assertEqual(mod_scalar.type().kind(), ta.TypeKind.REAL)
@@ -184,7 +193,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertEqual(add_scalar.type().kind(), ta.TypeKind.BIGINT)
         self.assert_Column(add_scalar, [2, -1, None, 4, -3, None])
 
-    def test_SimpleColumnFloat32_unary(self):
+    def test_SimpleColumnFloat32_unary(self) -> None:
         data = [1.2, -2.3, None, 3.4, -4.6, None]
         col = infer_column(data)
         self.assertEqual(col.type().kind(), ta.TypeKind.REAL)
@@ -201,7 +210,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assert_Column(round_col, [1.0, -2.0, None, 3.0, -5.0, None])
         self.assertEqual(round_col.type().kind(), ta.TypeKind.REAL)
 
-    def test_SimpleColumnBoolean(self):
+    def test_SimpleColumnBoolean(self) -> None:
         data = [True, True, True, True]
         col = infer_column(data)
 
@@ -225,7 +234,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertEqual(col.is_null_at(3), False)
         self.assertEqual(col.is_null_at(4), True)
 
-    def test_SimpleColumnBoolean_unary(self):
+    def test_SimpleColumnBoolean_unary(self) -> None:
         data = [True, False, None, True, False, None]
         col = infer_column(data)
         self.assertEqual(col.type().kind(), ta.TypeKind.BOOLEAN)
@@ -234,7 +243,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertEqual(inv_col.type().kind(), ta.TypeKind.BOOLEAN)
         self.assert_Column(inv_col, [False, True, None, False, True, None])
 
-    def test_SimpleColumnString(self):
+    def test_SimpleColumnString(self) -> None:
         data = ["0", "1", "2", "3"]
         col = infer_column(data)
 
@@ -258,66 +267,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertEqual(col.is_null_at(3), False)
         self.assertEqual(col.is_null_at(4), True)
 
-    def test_SimpleColumnString_unary(self):
-        data = ["abc", "ABC", "XYZ123", None, "xYZ", "123", "äöå", ",.!"]
-        col = infer_column(data)
-
-        lcol = col.lower()
-        self.assert_Column(
-            lcol, ["abc", "abc", "xyz123", None, "xyz", "123", "äöå", ",.!"]
-        )
-
-        ucol = col.upper()
-        self.assert_Column(
-            ucol, ["ABC", "ABC", "XYZ123", None, "XYZ", "123", "ÄÖÅ", ",.!"]
-        )
-
-        lcol2 = ucol.lower()
-        self.assert_Column(
-            lcol2, ["abc", "abc", "xyz123", None, "xyz", "123", "äöå", ",.!"]
-        )
-
-        ucol2 = lcol.upper()
-        self.assert_Column(
-            ucol2, ["ABC", "ABC", "XYZ123", None, "XYZ", "123", "ÄÖÅ", ",.!"]
-        )
-
-        alpha = col.isalpha()
-        self.assert_Column(alpha, [True, True, False, None, True, False, True, False])
-
-        alnum = col.isalnum()
-        self.assert_Column(alnum, [True, True, True, None, True, True, True, False])
-
-        integer = col.isinteger()
-        self.assert_Column(
-            integer, [False, False, False, None, False, True, False, False]
-        )
-
-    def test_SimpleColumnString_islower(self):
-        data = {
-            "abc": True,
-            "": False,
-            " ": False,
-            "a  ": True,
-            "123": False,
-            "a123": True,
-            ",.!": False,
-            "a,.!": True,
-            "ABC": False,
-            "abcXyz": False,
-            None: None,
-            "äöå": True,
-            "äöå  123 ,.!": True,
-            "ÄÖÅ": False,
-            "öÄå": False,
-            "♬ ♫ ♯": False,
-            "abc ♬ ♫ ♯": True,
-        }
-        col = infer_column(list(data.keys()))
-        islower = col.islower()
-        self.assert_Column(islower, list(data.values()))
-
-    def test_SimpleColumnUTF(self):
+    def test_SimpleColumnUTF(self) -> None:
         s = ["hello.this", "is.interesting.", "this.is_24", "paradise"]
         col = infer_column(s)
         for i in range(4):
@@ -325,7 +275,12 @@ class TestSimpleColumns(BaseTestColumns):
 
         self.assertEqual(len(col), 4)
 
-    def test_ConstantColumn(self):
+    def test_ConstantColumn(self) -> None:
+        # INTEGER
+        col = ta.ConstantColumn(42, 6, ta.VeloxType_INTEGER())
+        self.assertTrue(isinstance(col.type(), ta.VeloxType_INTEGER))
+        self.assert_Column(col, [42] * 6)
+
         ###########
         #  BIGINT
         col = ta.ConstantColumn(42, 6)
@@ -366,7 +321,7 @@ class TestSimpleColumns(BaseTestColumns):
         self.assertTrue(isinstance(col.type(), ta.VeloxType_VARCHAR))
         self.assert_Column(col, ["abc"] * 6)
 
-    def test_FromPyList(self):
+    def test_FromPyList(self) -> None:
         #  BIGINT
         col = ta.Column(ta.VeloxType_BIGINT(), [1, 2, None, 4])
         self.assertTrue(isinstance(col.type(), ta.VeloxType_BIGINT))
@@ -431,7 +386,7 @@ class TestSimpleColumns(BaseTestColumns):
         #     col, [[("foo", 1), ("bar", 2)], None, [("abc", 3), ("def", 4)]]
         # )
 
-    def test_NullCount(self):
+    def test_NullCount(self) -> None:
         col = infer_column([None, 1, 2, None])
         self.assertEqual(col.get_null_count(), 2)
 
@@ -445,6 +400,136 @@ class TestSimpleColumns(BaseTestColumns):
         colSlice = col.slice(1, 2)
         self.assertEqual(colSlice.get_null_count(), 0)
         self.assertEqual(col.get_null_count(), 2)
+
+    def test_ToArrow_Numerical(self) -> None:
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+        col = infer_column([None, 1, 2, None])
+        col._export_to_arrow(ptr_array)
+        self.assertEqual(c_array.length, 4)
+        self.assertEqual(c_array.null_count, 2)
+        self.assertEqual(c_array.n_buffers, 2)
+        vals = ffi.cast("int64_t*", c_array.buffers[1])
+        self.assertEqual(vals[1], 1)
+        self.assertEqual(vals[2], 2)
+        self.assertEqual(c_array.n_children, 0)
+        self.assertNotEqual(c_array.release, ffi.NULL)
+
+        c_array_slice = ffi.new("struct ArrowArray*")
+        ptr_array_slice = int(ffi.cast("uintptr_t", c_array_slice))
+
+        col_slice = col.slice(1, 3)
+        col_slice._export_to_arrow(ptr_array_slice)
+        self.assertEqual(c_array_slice.length, 3)
+        self.assertEqual(c_array_slice.null_count, 1)
+        self.assertEqual(c_array_slice.n_buffers, 2)
+        vals_slice = ffi.cast("int64_t*", c_array_slice.buffers[1])
+        self.assertEqual(vals_slice[0], 1)
+        self.assertEqual(vals_slice[1], 2)
+        self.assertEqual(c_array_slice.n_children, 0)
+        self.assertNotEqual(c_array_slice.release, ffi.NULL)
+
+    def test_ToArrow_Struct(self) -> None:
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+        col = ta.Column(
+            ta.VeloxRowType(
+                ["f1", "f2"],
+                [ta.VeloxType_INTEGER(), ta.VeloxType_INTEGER()],
+            )
+        )
+        col.child_at(0).append(1)
+        col.child_at(1).append(10)
+        col.set_length(1)
+        col.child_at(0).append(2)
+        col.child_at(1).append(20)
+        col.set_length(2)
+
+        col._export_to_arrow(ptr_array)
+        self.assertEqual(c_array.length, 2)
+        self.assertEqual(c_array.null_count, 0)
+        self.assertEqual(c_array.n_buffers, 1)
+        self.assertEqual(c_array.n_children, 2)
+        self.assertNotEqual(c_array.release, ffi.NULL)
+
+        # pyre-fixme[16]: `pa.StructArray` has no attribute `_import_from_c`.
+        s = pa.StructArray._import_from_c(
+            ptr_array,
+            pa.struct(
+                [
+                    pa.field("f1", pa.int32(), nullable=False),
+                    pa.field("f2", pa.int32(), nullable=False),
+                ]
+            ),
+        )
+
+        self.assertTrue(isinstance(s, pa.StructArray))
+        self.assertEqual(len(s), len(col))
+        self.assertEqual(pa.StructArray.field(s, 0).to_pylist(), [1, 2])
+        self.assertEqual(pa.StructArray.field(s, 1).to_pylist(), [10, 20])
+
+    def test_FromArrow_Numerical(self) -> None:
+        c_schema = ffi.new("struct ArrowSchema*")
+        ptr_schema = int(ffi.cast("uintptr_t", c_schema))
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+        a = pa.array([None, 1, 2, None])
+        # pyre-fixme[16]: Item `Array` of `Union[Array[typing.Any], ChunkedArray]`
+        #  has no attribute `_export_to_c`.
+        a._export_to_c(ptr_array, ptr_schema)
+        col = ta._import_from_arrow(ta.VeloxType_BIGINT(), ptr_array, ptr_schema)
+        self.assertEqual(len(col), 4)
+        self.assertEqual(col.get_null_count(), 2)
+        self.assertTrue(col.is_null_at(0))
+        self.assertEqual(col[1], 1)
+        self.assertEqual(col[2], 2)
+        self.assertTrue(col.is_null_at(3))
+        self.assertEqual(c_array.release, ffi.NULL)
+        self.assertEqual(c_schema.release, ffi.NULL)
+
+    def test_FromArrow_Struct(self) -> None:
+        c_schema = ffi.new("struct ArrowSchema*")
+        ptr_schema = int(ffi.cast("uintptr_t", c_schema))
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+
+        f1 = pa.array([1, 2, 3], type=pa.int64())
+        f2 = pa.array([True, False, None], type=pa.bool_())
+        s = pa.StructArray.from_arrays(
+            # pyre-fixme[6]: In call `pa.StructArray.from_arrays`, for 1st positional only parameter expected `Iterable[Array[typing.Any]]` but got `Iterable[Union[Array[typing.Any], ChunkedArray]]`
+            [f1, f2],
+            fields=[
+                # pyre-fixme[16]: Item `pa.Array` of `typing.Union[pa.Array[typing.Any], pa.ChunkedArray]` has no attribute `type`.
+                pa.field("f1", f1.type, nullable=False),
+                # pyre-fixme[16]: Item `pa.Array` of `typing.Union[pa.Array[typing.Any], pa.ChunkedArray]` has no attribute `type`.
+                pa.field("f2", f2.type, nullable=True),
+            ],
+        )
+
+        # pyre-fixme[16]: Item `Array` of `Union[Array[typing.Any], ChunkedArray]`
+        #  has no attribute `_export_to_c`.
+        s._export_to_c(ptr_array, ptr_schema)
+        col = ta._import_from_arrow(
+            ta.VeloxRowType(
+                ["f1", "f2"],
+                [ta.VeloxType_INTEGER(), ta.VeloxType_BOOLEAN()],
+            ),
+            ptr_array,
+            ptr_schema,
+        )
+        self.assertEqual(len(col), 3)
+        self.assertEqual(col.get_null_count(), 0)
+        self.assertEqual(col.child_at(0).get_null_count(), 0)
+        self.assertEqual(col.child_at(1).get_null_count(), 1)
+        self.assertEqual(col.type().name_of(0), "f1")
+        self.assertEqual(col.type().name_of(1), "f2")
+        self.assert_Column(col.child_at(0), [1, 2, 3])
+        self.assert_Column(col.child_at(1), [True, False, None])
+        self.assertEqual(c_array.release, ffi.NULL)
+        self.assertEqual(c_schema.release, ffi.NULL)
 
 
 def is_same_type(a, b) -> bool:
@@ -569,7 +654,8 @@ def _infer_column(data) -> Union[ta.BaseColumn, Unresolved, None]:
             values_array_type = inferred_values_array_columns.type()
 
             if isinstance(keys_array_type, ta.VeloxArrayType) and isinstance(
-                values_array_type, ta.VeloxArrayType
+                values_array_type,
+                ta.VeloxArrayType,
             ):
                 col = ta.Column(
                     ta.VeloxMapType(
@@ -632,53 +718,54 @@ def resolve_column(item, type_) -> ta.BaseColumn:
 
 
 class TestInferColumn(unittest.TestCase):
-    def test_infer_simple(self):
+    def test_infer_simple(self) -> None:
         data = [1, 2, 3]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxType_BIGINT()))
 
-    def test_infer_array(self):
+    def test_infer_array(self) -> None:
         data = [[1], [2], [3]]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxArrayType(ta.VeloxType_BIGINT())))
 
-    def test_infer_nested_array(self):
+    def test_infer_nested_array(self) -> None:
         data = [[[1]], [[2], [5]], [[3, 4]]]
         type_ = infer_column(data).type()
         self.assertTrue(
             is_same_type(
-                type_, ta.VeloxArrayType(ta.VeloxArrayType(ta.VeloxType_BIGINT()))
+                type_,
+                ta.VeloxArrayType(ta.VeloxArrayType(ta.VeloxType_BIGINT())),
             )
         )
 
-    def test_unresolved(self):
+    def test_unresolved(self) -> None:
         data = []
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxType_BIGINT()))
 
-    def test_nested_unresolved1(self):
+    def test_nested_unresolved1(self) -> None:
         data = [[]]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxArrayType(ta.VeloxType_BIGINT())))
 
-    def test_nested_unresolved2(self):
+    def test_nested_unresolved2(self) -> None:
         data = [None]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxType_BIGINT()))
 
-    def test_nested_unresolved3(self):
+    def test_nested_unresolved3(self) -> None:
         data = [[None]]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxArrayType(ta.VeloxType_BIGINT())))
 
-    def test_propagate_unresolved(self):
+    def test_propagate_unresolved(self) -> None:
         data = [None, [], [1], [1, None, 2], None]
         type_ = infer_column(data).type()
         self.assertTrue(is_same_type(type_, ta.VeloxArrayType(ta.VeloxType_BIGINT())))
 
 
 class TestArrayColumns(BaseTestColumns):
-    def test_ArrayColumnInt64(self):
+    def test_ArrayColumnInt64(self) -> None:
         data = [None, [], [1], [1, None, 2], None]
         col = infer_column(data)
 
@@ -701,9 +788,13 @@ class TestArrayColumns(BaseTestColumns):
                             self.assertTrue(sliced_col[i].is_null_at(j))
                         else:
                             self.assertFalse(sliced_col[i].is_null_at(j))
+                            # pyre-fixme[16]: Item `None` of `Union[None,
+                            #  List[typing.Any], List[int],
+                            #  List[typing.Optional[int]]]` has no attribute
+                            #  `__getitem__`.
                             self.assertEqual(sliced_col[i][j], sliced_data[i][j])
 
-    def test_NestedArrayColumnInt64(self):
+    def test_NestedArrayColumnInt64(self) -> None:
         data = [[[1, 2], None, [3, 4]], [[4], [5]]]
         col = infer_column(data)
         self.assertEqual(col[0][0][0], 1)
@@ -714,7 +805,7 @@ class TestArrayColumns(BaseTestColumns):
         self.assertEqual(col[1][0][0], 4)
         self.assertEqual(col[1][1][0], 5)
 
-    def test_NestedArrayColumnString(self):
+    def test_NestedArrayColumnString(self) -> None:
         data = [[], [[]], [["a"]], [["b", "c"], ["d", "e", "f"]]]
         col = infer_column(data)
         self.assertEqual(len(col[0]), 0)
@@ -729,7 +820,7 @@ class TestArrayColumns(BaseTestColumns):
 
 
 class TestMapColumns(unittest.TestCase):
-    def test_MapColumnInt64(self):
+    def test_MapColumnInt64(self) -> None:
         data = [{"a": 1, "b": 2}, {"c": 3, "d": 4, "e": 5}]
         col = infer_column(data)
         self.assertEqual(len(col), 2)
@@ -767,7 +858,7 @@ class TestMapColumns(unittest.TestCase):
         self.assertEqual(values[0][1], 4)
         self.assertEqual(values[0][2], 5)
 
-    def test_MapColumnInt64_with_none(self):
+    def test_MapColumnInt64_with_none(self) -> None:
         data = [None, {"a": 1, "b": 2}, {"c": None, "d": 4, "e": 5}]
         col = infer_column(data)
         self.assertEqual(len(col), 3)
@@ -806,10 +897,11 @@ class TestMapColumns(unittest.TestCase):
 
 
 class TestRowColumns(unittest.TestCase):
-    def test_RowColumn1(self):
+    def test_RowColumn1(self) -> None:
         col = ta.Column(
             ta.VeloxRowType(
-                ["a", "b"], [ta.VeloxType_INTEGER(), ta.VeloxType_VARCHAR()]
+                ["a", "b"],
+                [ta.VeloxType_INTEGER(), ta.VeloxType_VARCHAR()],
             )
         )
         col.child_at(0).append(1)
@@ -834,10 +926,11 @@ class TestRowColumns(unittest.TestCase):
             sliced_col.child_at(sliced_col.type().get_child_idx("b"))[0], "y"
         )
 
-    def test_set_child(self):
+    def test_set_child(self) -> None:
         col = ta.Column(
             ta.VeloxRowType(
-                ["a", "b"], [ta.VeloxType_INTEGER(), ta.VeloxType_VARCHAR()]
+                ["a", "b"],
+                [ta.VeloxType_INTEGER(), ta.VeloxType_VARCHAR()],
             )
         )
         col.child_at(0).append(1)
@@ -857,14 +950,15 @@ class TestRowColumns(unittest.TestCase):
         self.assertEqual(col.child_at(col.type().get_child_idx("a"))[1], 4)
         self.assertEqual(col.child_at(col.type().get_child_idx("b"))[1], "y")
 
-    def test_nested_row(self):
+    def test_nested_row(self) -> None:
         col = ta.Column(
             ta.VeloxRowType(
                 ["a", "b"],
                 [
                     ta.VeloxType_INTEGER(),
                     ta.VeloxRowType(
-                        ["b1", "b2"], [ta.VeloxType_VARCHAR(), ta.VeloxType_INTEGER()]
+                        ["b1", "b2"],
+                        [ta.VeloxType_VARCHAR(), ta.VeloxType_INTEGER()],
                     ),
                 ],
             )

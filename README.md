@@ -1,48 +1,51 @@
-# TorchArrow (Warning: Unstable Prototype)
+# TorchArrow: a data processing library for PyTorch
 
-**This is a prototype library currently under heavy development. It does not currently have stable releases, and as such will likely be modified significantly in backwards compatibility breaking ways until beta release (targeting early 2022). If you have suggestions on the API or use cases you would like to be covered, please open a GitHub issue. We would love to hear thoughts and feedback.**
+**This library currently does not have a stable release. The API and implementation may change. 
+Future changes may not be backward compatible.**
 
-TorchArrow is a [torch](https://github.com/pytorch/pytorch).Tensor-like Python DataFrame library for data preprocessing in deep learning. It supports multiple execution runtimes and [Arrow](https://github.com/apache/arrow) as a common format.
+TorchArrow is a [torch](https://github.com/pytorch/pytorch).Tensor-like Python DataFrame library for data preprocessing in PyTorch models, with two high-level features:
 
-It plans to provide:
-
-* Python Dataframe library focusing on streaming-friendly APIs for data preprocessing in deep learning
-* Seamless handoff with [PyTorch](https://github.com/pytorch/pytorch) or other model authoring, such as Tensor collation and easily plugging into PyTorch DataLoader and [DataPipes](https://github.com/pytorch/data#what-are-datapipes)
-* Zero copy for external readers via [Arrow](https://github.com/apache/arrow) in-memory columnar format
-* Multiple execution runtimes support:
-    - High-performance CPU backend via [Velox](https://github.com/facebookincubator/velox/)
-    - GPU backend via [libcudf](https://docs.rapids.ai/api/libcudf/stable/)
-* High-performance C++ UDF support with vectorization
+* DataFrame library (like Pandas) with strong GPU or other hardware acceleration (under development) and PyTorch ecosystem integration.
+* Columnar memory layout based on [Apache Arrow](https://arrow.apache.org/docs/format/Columnar.html#physical-memory-layout) with strong variable-width and nested data support (such as string, list, map) and Arrow ecosystem integration.
 
 ## Installation
 
-You will need Python 3.8 or later. Also, we highly recommend installing an [Miniconda](https://docs.conda.io/en/latest/miniconda.html#latest-miniconda-installer-links) environment.
+You will need Python 3.7 or later. Also, we highly recommend installing an [Miniconda](https://docs.conda.io/en/latest/miniconda.html#latest-miniconda-installer-links) environment.
 
 First, set up an environment. If you are using conda, create a conda environment:
 ```
-conda create --name torcharrow python=3.8
+conda create --name torcharrow python=3.7
 conda activate torcharrow
 ```
 
-### Binaries (Experimental)
+### Version Compatibility
 
-#### MacOS
+The following is the corresponding `torcharrow` versions and supported Python versions.
 
-Experimental binary on MacOS can be installed via pip wheels:
+| `torch`            | `torcharrow`        | `python`          |
+| ------------------ | ------------------ | ----------------- |
+| `main` / `nightly` | `main` / `nightly` | `>=3.7`, `<=3.10` |
+| `1.13.0`           | `0.2.0`            | `>=3.7`, `<=3.10` |
+
+
+### Colab
+
+Follow the instructions [in this Colab notebook](https://colab.research.google.com/drive/1S0ldwN7qNM37E4WZnnAEnzn1DWnAQ6Vt)
+
+### Nightly Binaries
+
+Experimental nightly binary on macOS (requires macOS SDK >= 10.15) and Linux (requires glibc >= 2.17) for Python 3.7, 3.8, and 3.9 can be installed via pip wheels:
 ```
-pip install torcharrow==0.0.2.dev20211122
+pip install --pre torcharrow -f https://download.pytorch.org/whl/nightly/cpu/torch_nightly.html
 ```
-
-#### Linux
-Coming soon!
 
 ### From Source
 
-If you are installing from source, you will need Python 3.8 or later and a C++17 compiler.
+If you are installing from source, you will need Python 3.7 or later and a C++17 compiler.
 
 #### Get the TorchArrow Source
 ```bash
-git clone --recursive https://github.com/facebookresearch/torcharrow
+git clone --recursive https://github.com/pytorch/torcharrow
 cd torcharrow
 # if you are updating an existing checkout
 git submodule sync --recursive
@@ -51,16 +54,16 @@ git submodule update --init --recursive
 
 #### Install Dependencies
 
-On MacOS
+On macOS
 
-[HomeBrew](https://brew.sh/) is required to install development tools on MacOS.
+[HomeBrew](https://brew.sh/) is required to install development tools on macOS.
 
 ```bash
 # Install dependencies from Brew
-brew install --formula ninja cmake ccache protobuf icu4c boost gflags glog libevent lz4 lzo snappy xz zstd
+brew install --formula ninja flex bison cmake ccache icu4c boost gflags glog libevent
 
 # Build and install other dependencies
-scripts/build_mac_dep.sh ranges_v3 googletest fmt double_conversion folly re2
+scripts/build_mac_dep.sh ranges_v3 fmt double_conversion folly re2
 ```
 
 On Ubuntu (20.04 or later)
@@ -68,11 +71,9 @@ On Ubuntu (20.04 or later)
 # Install dependencies from APT
 apt install -y g++ cmake ccache ninja-build checkinstall \
     libssl-dev libboost-all-dev libdouble-conversion-dev libgoogle-glog-dev \
-    libbz2-dev libgflags-dev libgtest-dev libgmock-dev libevent-dev libfmt-dev \
-    libprotobuf-dev liblz4-dev libzstd-dev libre2-dev libsnappy-dev liblzo2-dev \
-    protobuf-compiler
-# Build and install Folly
-scripts/install_ubuntu_folly.sh
+    libgflags-dev libevent-dev libre2-dev libfl-dev libbison-dev
+# Build and install folly and fmt
+scripts/setup-ubuntu.sh
 ```
 
 #### Install TorchArrow
@@ -86,17 +87,10 @@ And run unit tests with
 python -m unittest -v
 ```
 
-To install TorchArrow with release mode (WARNING: may take very long to build):
+To build and install TorchArrow with release mode:
 ```
 python setup.py install
 ```
-
-
-## Documentation
-This [10 minutes tutorial](https://github.com/facebookresearch/torcharrow/blob/main/tutorial/tutorial.ipynb) provides a short introduction to TorchArrow. More documents on advanced topics are coming soon!
-
-## Future Plans
-We hope to sufficiently expand the library, harden APIs, and gather feedback to enable a beta release at the time of the PyTorch 1.11 release (early 2022).
 
 ## License
 

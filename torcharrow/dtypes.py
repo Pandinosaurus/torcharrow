@@ -1,90 +1,41 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import dataclasses
 import inspect
-import re
 import typing as ty
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace, is_dataclass
+from dataclasses import dataclass, is_dataclass, replace
 
 import numpy as np
 import torcharrow._torcharrow
 import typing_inspect
 
+from .dtypes_core import (
+    Boolean,
+    DType,
+    Field,
+    Float32,
+    Float64,
+    Int16,
+    Int32,
+    Int64,
+    Int8,
+    List,
+    Map,
+    MetaData,
+    NL,
+    String,
+    Struct,
+)
+
 # -----------------------------------------------------------------------------
 # Aux
 
-# Pretty printing constants; reused everywhere
-OPEN = "{"
-CLOSE = "}"
-NL = "\n"
-
 # Handy Type abbreviations; reused everywhere
 ScalarTypes = ty.Union[int, float, bool, str]
-
-
-# -----------------------------------------------------------------------------
-# Schema and Field
-
-MetaData = ty.Dict[str, str]
-
-
-@dataclass(frozen=True)
-class Field:
-    name: str
-    dtype: "DType"
-    metadata: ty.Optional[MetaData] = None
-
-    def __str__(self):
-        meta = ""
-        if self.metadata is not None:
-            meta = (
-                f"meta = {OPEN}{', '.join(f'{k}: {v}' for k,v in self.metadata)}{CLOSE}"
-            )
-        return f"Field('{self.name}', {str(self.dtype)}{meta})"
-
-
-# -----------------------------------------------------------------------------
-# Immutable Types with structural equality...
-
-
-@dataclass(frozen=True)  # type: ignore
-class DType(ABC):
-
-    typecode: ty.ClassVar[str] = "__TO_BE_DEFINED_IN_SUBCLASS__"
-    arraycode: ty.ClassVar[str] = "__TO_BE_DEFINED_IN_SUBCLASS__"
-
-    @property
-    @abstractmethod
-    def nullable(self):
-        return False
-
-    @property
-    def py_type(self):
-        return type(self.default_value())
-
-    def __str__(self):
-        if self.nullable:
-            return f"{self.name.title()}(nullable=True)"
-        else:
-            return self.name
-
-    @abstractmethod
-    def constructor(self, nullable):
-        pass
-
-    def with_null(self, nullable=True):
-
-        return self.constructor(nullable)
-
-    def default_value(self):
-        # must be overridden by all non primitive types!
-        return type(self).default
-
-    def __qualstr__(self):
-        return "torcharrow.dtypes"
-
-
-# for now: no float16, and all date and time stuff, no categorical, (and Null is called Void)
 
 
 @dataclass(frozen=True)
@@ -97,245 +48,6 @@ class Void(DType):
 
     def constructor(self, nullable):
         return Void(nullable)
-
-
-@dataclass(frozen=True)  # type: ignore
-class Numeric(DType):
-    pass
-
-
-@dataclass(frozen=True)
-class Boolean(DType):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "b"
-    arraycode: ty.ClassVar[str] = "b"
-    name: ty.ClassVar[str] = "boolean"
-    default: ty.ClassVar[bool] = False
-
-    def constructor(self, nullable):
-        return Boolean(nullable)
-
-
-@dataclass(frozen=True)
-class Int8(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "c"
-    arraycode: ty.ClassVar[str] = "b"
-    name: ty.ClassVar[str] = "int8"
-    default: ty.ClassVar[int] = 0
-
-    def constructor(self, nullable):
-        return Int8(nullable)
-
-
-@dataclass(frozen=True)
-class Int16(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "s"
-    arraycode: ty.ClassVar[str] = "h"
-    name: ty.ClassVar[str] = "int16"
-    default: ty.ClassVar[int] = 0
-
-    def constructor(self, nullable):
-        return Int16(nullable)
-
-
-@dataclass(frozen=True)
-class Int32(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "i"
-    arraycode: ty.ClassVar[str] = "i"
-    name: ty.ClassVar[str] = "int32"
-    default: ty.ClassVar[int] = 0
-
-    def constructor(self, nullable):
-        return Int32(nullable)
-
-
-@dataclass(frozen=True)
-class Int64(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "l"
-    arraycode: ty.ClassVar[str] = "l"
-    name: ty.ClassVar[str] = "int64"
-    default: ty.ClassVar[int] = 0
-
-    def constructor(self, nullable):
-        return Int64(nullable)
-
-
-# Not all Arrow types are supported. We don't have a backend to support unsigned
-# integer types right now so they are removed to not confuse users. Feel free to
-# add unsigned int types when we have a supporting backend.
-
-
-@dataclass(frozen=True)
-class Float32(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "f"
-    arraycode: ty.ClassVar[str] = "f"
-    name: ty.ClassVar[str] = "float32"
-    default: ty.ClassVar[float] = 0.0
-
-    def constructor(self, nullable):
-        return Float32(nullable)
-
-
-@dataclass(frozen=True)
-class Float64(Numeric):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "g"
-    arraycode: ty.ClassVar[str] = "d"
-    name: ty.ClassVar[str] = "float64"
-    default: ty.ClassVar[float] = 0.0
-
-    def constructor(self, nullable):
-        return Float64(nullable)
-
-
-@dataclass(frozen=True)
-class String(DType):
-    nullable: bool = False
-    typecode: ty.ClassVar[str] = "u"  # utf8 string (n byte)
-    arraycode: ty.ClassVar[str] = "w"  # wchar_t (2 byte)
-    name: ty.ClassVar[str] = "string"
-    default: ty.ClassVar[str] = ""
-
-    def constructor(self, nullable):
-        return String(nullable)
-
-
-@dataclass(frozen=True)
-class Map(DType):
-    key_dtype: DType
-    item_dtype: DType
-    nullable: bool = False
-    keys_sorted: bool = False
-    name: ty.ClassVar[str] = "Map"
-    typecode: ty.ClassVar[str] = "+m"
-    arraycode: ty.ClassVar[str] = ""
-
-    @property
-    def py_type(self):
-        return ty.Dict[self.key_dtype.py_type, self.item_dtype.py_type]
-
-    def constructor(self, nullable):
-        return Map(self.key_dtype, self.item_dtype, nullable)
-
-    def __str__(self):
-        nullable = ", nullable=" + str(self.nullable) if self.nullable else ""
-        return f"Map({self.key_dtype}, {self.item_dtype}{nullable})"
-
-    def default_value(self):
-        return {}
-
-
-@dataclass(frozen=True)
-class List(DType):
-    item_dtype: DType
-    nullable: bool = False
-    fixed_size: int = -1
-    name: ty.ClassVar[str] = "List"
-    typecode: ty.ClassVar[str] = "+l"
-    arraycode: ty.ClassVar[str] = ""
-
-    @property
-    def py_type(self):
-        return ty.List[self.item_dtype.py_type]
-
-    def constructor(self, nullable):
-        return List(self.item_dtype, nullable)
-
-    def __str__(self):
-        nullable = ", nullable=" + str(self.nullable) if self.nullable else ""
-        fixed_size = (
-            ", fixed_size=" + str(self.fixed_size) if self.fixed_size >= 0 else ""
-        )
-        return f"List({self.item_dtype}{nullable}{fixed_size})"
-
-    def default_value(self):
-        return []
-
-
-@dataclass(frozen=True)
-class Struct(DType):
-    fields: ty.List[Field]
-    nullable: bool = False
-    is_dataframe: bool = False
-    metadata: ty.Optional[MetaData] = None
-    name: ty.ClassVar[str] = "Struct"
-    typecode: ty.ClassVar[str] = "+s"
-    arraycode: ty.ClassVar[str] = ""
-
-    # For generating NamedTuple class name for cached _py_type (done in __post__init__)
-    _py_type_id: ty.ClassVar[int] = 0
-
-    # TODO: perhaps this should be a private method
-    def get_index(self, name: str) -> int:
-        for idx, field in enumerate(self.fields):
-            if field.name == name:
-                return idx
-        return None
-
-    def __post_init__(self):
-        if self.nullable:
-            for f in self.fields:
-                if not f.dtype.nullable:
-                    raise TypeError(
-                        f"nullable structs require each field (like {f.name}) to be nullable as well."
-                    )
-        # cache the type instance, __setattr__ hack is needed due to the frozen dataclass
-        # the _py_type is not listed above to avoid participation in equality check
-
-        def fix_name(name, idx):
-            # Anonomous Row
-            if name == "":
-                return "f_" + str(idx)
-
-            # Remove invalid character for NamedTuple
-            # TODO: this might cause name duplicates, do disambiguation
-            name = re.sub("[^a-zA-Z0-9_]", "_", name)
-            if name == "" or name[0].isdigit() or name[0] == "_":
-                name = "f_" + name
-            return name
-
-        object.__setattr__(
-            self,
-            "_py_type",
-            ty.NamedTuple(
-                "_StructGenerated_NamedTuple_" + str(type(self)._py_type_id),
-                [
-                    (fix_name(f.name, idx), f.dtype.py_type)
-                    for (idx, f) in enumerate(self.fields)
-                ],
-            ),
-        )
-        type(self)._py_type_id += 1
-
-    @property
-    def py_type(self):
-        return self._py_type
-
-    def constructor(self, nullable):
-        return Struct(self.fields, nullable)
-
-    def get(self, name):
-        for f in self.fields:
-            if f.name == name:
-                return f.dtype
-        raise KeyError(f"{name} not among fields")
-
-    def __str__(self):
-        nullable = ", nullable=" + str(self.nullable) if self.nullable else ""
-        fields = f"[{', '.join(str(f) for f in self.fields)}]"
-        meta = ""
-        if self.metadata is not None:
-            meta = f", meta = {OPEN}{', '.join(f'{k}: {v}' for k,v in self.metadata)}{CLOSE}"
-        else:
-            return f"Struct({fields}{nullable}{meta})"
-
-    def default_value(self):
-        return tuple(f.dtype.default_value() for f in self.fields)
 
 
 # only used internally for type inference -------------------------------------
@@ -539,11 +251,13 @@ def contains_tuple(t: DType):
     if is_tuple(t):
         return True
     if is_list(t):
+        # pyre-fixme[16]: `DType` has no attribute `item_dtype`.
         return contains_tuple(t.item_dtype)
     if is_map(t):
+        # pyre-fixme[16]: `DType` has no attribute `key_dtype`.
         return contains_tuple(t.key_dtype) or contains_tuple(t.item_dtype)
     if is_struct(t):
-        return any(contains_tuple(f.dtype) for f in t.fields)
+        return any(contains_tuple(f.dtype) for f in ty.cast(Struct, t).fields)
 
     return False
 
@@ -597,7 +311,7 @@ def infer_dtype_from_value(value):
     raise AssertionError(f"unexpected case {value} of type {type(value)}")
 
 
-def infer_dtype_from_prefix(prefix):
+def infer_dtype_from_prefix(prefix: ty.Sequence) -> ty.Optional[DType]:
     if len(prefix) == 0:
         return Any()
     dtype = infer_dtype_from_value(prefix[0])
@@ -614,6 +328,7 @@ def infer_dtype_from_prefix(prefix):
 
 def infer_dype_from_callable_hint(
     func: ty.Callable,
+    # pyre-fixme[31]: Expression `Type])` is not a valid type.
 ) -> (ty.Optional[DType], ty.Optional[ty.Type]):
     dtype = None
     py_type = None
@@ -663,7 +378,7 @@ def promote(l, r):
     return None
 
 
-def common_dtype(l, r):
+def common_dtype(l: DType, r: DType) -> ty.Optional[DType]:
     if is_void(l):
         return r.with_null()
     if is_void(r):
@@ -677,16 +392,22 @@ def common_dtype(l, r):
         return String(l.nullable or r.nullable)
     if is_boolean_or_numerical(l) and is_boolean_or_numerical(r):
         return promote(l, r)
-    if is_tuple(l) and is_tuple(r) and len(l.fields) == len(r.fields):
+    if (
+        is_tuple(l)
+        and is_tuple(r)
+        and len(ty.cast(Struct, l).fields) == len(ty.cast(Struct, r).fields)
+    ):
         res = []
-        for i, j in zip(l.fields, r.fields):
+        for i, j in zip(ty.cast(Struct, l).fields, ty.cast(Struct, r).fields):
             m = common_dtype(i, j)
             if m is None:
                 return None
             res.append(m)
         return Tuple(res).with_null(l.nullable or r.nullable)
     if is_map(l) and is_map(r):
+        # pyre-fixme[16]: `DType` has no attribute `key_dtype`.
         k = common_dtype(l.key_dtype, r.key_dtype)
+        # pyre-fixme[16]: `DType` has no attribute `item_dtype`.
         i = common_dtype(l.item_dtype, r.item_dtype)
         return (
             Map(k, i).with_null(l.nullable or r.nullable)
@@ -811,7 +532,7 @@ def np_typeof_dtype(t: DType):  # -> np.dtype[]:
     )
 
 
-def typeof_np_ndarray(t: np.ndarray) -> ty.Union[DType, ty.Literal["object"]]:
+def typeof_np_ndarray(t: np.ndarray) -> DType:
     return typeof_np_dtype(t.dtype)
 
 
@@ -846,50 +567,6 @@ def typeof_np_dtype(t: np.dtype) -> DType:
     )
 
 
-def dtype_of_velox_type(vtype: torcharrow._torcharrow.VeloxType) -> DType:
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.BOOLEAN:
-        return Boolean(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.TINYINT:
-        return Int8(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.SMALLINT:
-        return Int16(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.INTEGER:
-        return Int32(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.BIGINT:
-        return Int64(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.REAL:
-        return Float32(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.DOUBLE:
-        return Float64(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.VARCHAR:
-        return String(nullable=True)
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.ARRAY:
-        return List(
-            item_dtype=dtype_of_velox_type(
-                ty.cast(torcharrow._torcharrow.VeloxArrayType, vtype).element_type()
-            ),
-            nullable=True,
-        )
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.MAP:
-        vtype = ty.cast(torcharrow._torcharrow.VeloxMapType, vtype)
-        return Map(
-            key_dtype=dtype_of_velox_type(vtype.key_type()),
-            item_dtype=dtype_of_velox_type(vtype.value_type()),
-            nullable=True,
-        )
-    if vtype.kind() == torcharrow._torcharrow.TypeKind.ROW:
-        vtype = ty.cast(torcharrow._torcharrow.VeloxRowType, vtype)
-        fields = [
-            Field(name=vtype.name_of(i), dtype=dtype_of_velox_type(vtype.child_at(i)))
-            for i in range(vtype.size())
-        ]
-        return Struct(fields=fields, nullable=True)
-
-    raise AssertionError(
-        f"translation of Velox typekind {vtype.kind()} to dtype unsupported"
-    )
-
-
 def cast_as(dtype):
     if is_string(dtype):
         return str
@@ -908,6 +585,15 @@ def get_underlying_dtype(dtype: DType) -> DType:
 
 def get_nullable_dtype(dtype: DType) -> DType:
     return replace(dtype, nullable=True)
+
+
+# Based on https://github.com/pytorch/pytorch/blob/c48e6f014a0cca0adc18e1a39a8fd724fe7ab83a/torch/_jit_internal.py#L1113-L1118
+def get_origin(target_type):
+    return getattr(target_type, "__origin__", None)
+
+
+def get_args(target_type):
+    return getattr(target_type, "__args__", None)
 
 
 def dtype_of_type(typ: ty.Union[ty.Type, DType]) -> DType:
@@ -930,19 +616,19 @@ def dtype_of_type(typ: ty.Union[ty.Type, DType]) -> DType:
         return Struct(
             [Field(f.name, dtype_of_type(f.type)) for f in dataclasses.fields(typ)]
         )
-    if ty.get_origin(typ) in (List, list):
-        args = ty.get_args(typ)
+    if get_origin(typ) in (List, list):
+        args = get_args(typ)
         assert len(args) == 1
         elem_type = dtype_of_type(args[0])
         return List(elem_type)
-    if ty.get_origin(typ) in (ty.Dict, dict):
-        args = ty.get_args(typ)
+    if get_origin(typ) in (ty.Dict, dict):
+        args = get_args(typ)
         assert len(args) == 2
         key = dtype_of_type(args[0])
         value = dtype_of_type(args[1])
         return Map(key, value)
     if typing_inspect.is_optional_type(typ):
-        args = ty.get_args(typ)
+        args = get_args(typ)
         assert len(args) == 2
         if issubclass(args[1], type(None)):
             contained = args[0]
@@ -966,16 +652,16 @@ def dtype_from_batch_pytype(typ: ty.Type) -> DType:
     """
     Like dtype_of_type but representing type hint for the set of rows. Can be a Column or a python List of nested types
     """
-    from .icolumn import IColumn
+    from .icolumn import Column
 
     assert type is not None
 
-    if inspect.isclass(typ) and issubclass(typ, IColumn):
+    if inspect.isclass(typ) and issubclass(typ, Column):
         # TODO: we need a type annotation for Columns with statically accessible dtype
-        raise TypeError("Cannot infer dtype from IColumn")
+        raise TypeError("Cannot infer dtype from Column")
 
-    if ty.get_origin(typ) in (List, list):
-        args = ty.get_args(typ)
+    if get_origin(typ) in (List, list):
+        args = get_args(typ)
         assert len(args) == 1
         return dtype_of_type(args[0])
 

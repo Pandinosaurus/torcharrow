@@ -1,4 +1,9 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from .numerical_column_cpu import *
 from .string_column_cpu import *
 from .list_column_cpu import *
@@ -10,6 +15,6 @@ import torcharrow._torcharrow
 # Initialize and register Velox functional
 import torcharrow.velox_rt.functional
 
-torcharrow._torcharrow.BaseColumn.dtype = (
-    lambda self: torcharrow.dtypes.dtype_of_velox_type(self.type())
-)
+from .typing import dtype_of_velox_type
+
+torcharrow._torcharrow.BaseColumn.dtype = lambda self: dtype_of_velox_type(self.type())

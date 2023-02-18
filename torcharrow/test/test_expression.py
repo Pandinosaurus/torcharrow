@@ -1,4 +1,9 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import builtins
 import operator
 import unittest
@@ -6,7 +11,7 @@ from abc import ABC, abstractmethod, abstractproperty
 from dataclasses import dataclass
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
-from torcharrow import Call, Expression, GetAttr, Var, eval_expression
+from torcharrow.expression import Call, eval_expression, Expression, GetAttr, Var
 
 # -----------------------------------------------------------------------------
 
@@ -38,7 +43,7 @@ class Cell:
         return self.val + n
 
     # kwargs
-    def get6(self, /, n=100, m=200):
+    def get6(self, n=100, m=200):
         return self.val + n + m
 
     @staticmethod

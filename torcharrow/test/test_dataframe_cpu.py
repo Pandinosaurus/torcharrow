@@ -1,10 +1,10 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import functools
-import statistics
-import unittest
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-import torcharrow.dtypes as dt
-from torcharrow import IDataFrame, Scope, me
+import unittest
 
 from .test_dataframe import TestDataFrame
 
@@ -64,6 +64,12 @@ class TestDataFrameCpu(TestDataFrame):
     def test_describe_dataframe(self):
         return self.base_test_describe_dataframe()
 
+    def test_drop_by_str_as_columns(self):
+        return self.base_test_drop_by_str_as_columns()
+
+    def test_drop_by_list_of_str_as_columns(self):
+        return self.base_test_drop_by_list_of_str_as_columns()
+
     def test_drop_keep_rename_reorder_pipe(self):
         return self.base_test_drop_keep_rename_reorder_pipe()
 
@@ -72,6 +78,12 @@ class TestDataFrameCpu(TestDataFrame):
 
     def test_locals_and_me_equivalence(self):
         return self.base_test_locals_and_me_equivalence()
+
+    def test_groupby_str(self):
+        return self.base_test_groupby_str()
+
+    def test_groupby_list_of_str(self):
+        return self.base_test_groupby_list_of_str()
 
     def test_groupby_size_pipe(self):
         return self.base_test_groupby_size_pipe()

@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import array as ar
 import functools
-from abc import abstractmethod
+import warnings
 from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    cast,
     Dict,
     Iterable,
+    Iterator,
     List,
-    Literal,
     Mapping,
     Optional,
+    OrderedDict,
     Sequence,
     Tuple,
     Union,
-    cast,
-    Iterable,
-    Iterator,
-    OrderedDict,
 )
 
 import numpy as np
+import pyarrow as pa
 import torcharrow as ta
 import torcharrow._torcharrow as velox
 import torcharrow.dtypes as dt
@@ -32,19 +36,19 @@ import torcharrow.pytorch as pytorch
 from tabulate import tabulate
 from torcharrow.dispatcher import Dispatcher
 from torcharrow.expression import eval_expression, expression
-from torcharrow.icolumn import IColumn
-from torcharrow.idataframe import IDataFrame
+from torcharrow.icolumn import Column
+from torcharrow.idataframe import DataFrame
 from torcharrow.scope import Scope
 from torcharrow.trace import trace, traceproperty
 
-from .column import ColumnFromVelox
+from .column import ColumnCpuMixin
 from .typing import get_velox_type
 
 # assumes that these have been imported already:
-# from .inumerical_column import INumericalColumn
-# from .istring_column import IStringColumn
-# from .imap_column import IMapColumn
-# from .ilist_column import IListColumn
+# from .inumerical_column import NumericalColumn
+# from .istring_column import StringColumn
+# from .imap_column import MapColumn
+# from .ilist_column import ListColumn
 
 # ------------------------------------------------------------------------------
 # DataFrame Factory with default scope and device
@@ -53,31 +57,31 @@ from .typing import get_velox_type
 # -----------------------------------------------------------------------------
 # DataFrames aka (StructColumns, can be nested as StructColumns:-)
 
-DataOrDTypeOrNone = Union[Mapping, Sequence, dt.DType, Literal[None]]
+DataOrDTypeOrNone = Optional[Union[Mapping, Sequence, dt.DType]]
 
 
-class DataFrameCpu(ColumnFromVelox, IDataFrame):
-    """Dataframe, ordered dict of typed columns of the same length"""
+class DataFrameCpu(ColumnCpuMixin, DataFrame):
+    """Dataframe on Velox backend"""
 
-    def __init__(self, device, dtype, data):
+    def __init__(self, device: str, dtype: dt.Struct, data: Dict[str, ColumnCpuMixin]):
         assert dt.is_struct(dtype)
-        IDataFrame.__init__(self, device, dtype)
+        DataFrame.__init__(self, device, dtype)
 
         self._data = velox.Column(get_velox_type(dtype))
-        assert isinstance(data, dict)
-        first = True
-        for key, value in data.items():
-            assert isinstance(value, ColumnFromVelox)
-            assert first or len(value) == len(self._data)
-            first = False
-            # TODO: using a dict for field type lookup
-            (field_dtype,) = (f.dtype for f in self.dtype.fields if f.name == key)
+        assert isinstance(data, Dict)
 
-            col = value
-            idx = self._data.type().get_child_idx(key)
-            self._data.set_child(idx, col._data)
-            self._data.set_length(len(col))
-        self._finialized = False
+        if len(data) != 0:
+            # pyre-fixme[6]: For 1st param expected `Sized` but got `ColumnCpuMixin`.
+            length = len(next(iter(data.values())))
+            for idx, (_, col) in enumerate(data.items()):
+                assert isinstance(col, ColumnCpuMixin)
+                # pyre-fixme[6]: For 1st param expected `Sized` but got
+                #  `ColumnCpuMixin`.
+                assert len(col) == length
+                self._data.set_child(idx, col._data)
+            self._data.set_length(length)
+
+        self._finalized = False
 
     @property
     def _mask(self) -> List[bool]:
@@ -85,15 +89,23 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     # Any _full requires no further type changes..
     @staticmethod
-    def _full(device, data: Dict[str, ColumnFromVelox], dtype=None, mask=None):
+    def _full(
+        device: str,
+        data: Dict[str, ColumnCpuMixin],
+        dtype: Optional[dt.Struct] = None,
+        mask=None,
+    ):
         assert mask is None  # TODO: remove mask parameter in _FullColumn
         cols = data.values()  # TODO: also allow data to be a single Velox RowColumn
-        assert all(isinstance(c, ColumnFromVelox) for c in data.values())
+        assert all(isinstance(c, ColumnCpuMixin) for c in data.values())
         ct = 0
         if len(data) > 0:
+            # pyre-fixme[6]: For 1st param expected `Sized` but got `ColumnCpuMixin`.
             ct = len(list(cols)[0])
+            # pyre-fixme[6]: For 1st param expected `Sized` but got `ColumnCpuMixin`.
             if not all(len(c) == ct for c in cols):
                 ValueError(f"length of all columns must be the same (e.g {ct})")
+        # pyre-fixme[16]: `ColumnCpuMixin` has no attribute `dtype`.
         inferred_dtype = dt.Struct([dt.Field(n, c.dtype) for n, c in data.items()])
         if dtype is None:
             dtype = inferred_dtype
@@ -107,45 +119,102 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     # Any _empty must be followed by a _finalize; no other ops are allowed during this time
 
     @staticmethod
-    def _empty(device, dtype):
+    def _empty(device: str, dtype: dt.Struct):
         field_data = {f.name: Scope._EmptyColumn(f.dtype, device) for f in dtype.fields}
         return DataFrameCpu(device, dtype, field_data)
 
     @staticmethod
-    def _fromlist(device, data: List, dtype):
+    def _from_pysequence(device: str, data: Sequence, dtype: dt.Struct):
+        if len(data) == 0:
+            return DataFrameCpu._empty(device, dtype)._finalize()
+
+        if isinstance(data[0], tuple):
+            # Input is list of tuple
+            # Convert to "columnar representation", e.g. each list represents a column
+            col_lists = [[*x] for x in zip(*data)]
+            if len(col_lists) != len(dtype.fields):
+                raise ValueError(
+                    f"Mismatched number of input columns ({len(col_lists)}) vs. number of fields {len(dtype.fields)}"
+                )
+
+            field_data = {
+                dtype.fields[i].name: ta.from_pysequence(
+                    col_lists[i], dtype.fields[i].dtype, device
+                )
+                for i in range(len(dtype.fields))
+            }
+            # pyre-fixme[6]: For 3rd param expected `Dict[str, ColumnCpuMixin]` but
+            #  got `Dict[str, Column]`.
+            return DataFrameCpu(device, dtype, field_data)
+
+        # append-based (extremenly ineffincient) implementation
+        warnings.warn(
+            f"Construct DataFrame from a list of {type(data[0])} may result in degeneraded performance"
+        )
         # default (ineffincient) implementation
         col = DataFrameCpu._empty(device, dtype)
         for i in data:
             col._append(i)
         return col._finalize()
 
+    @staticmethod
+    def _from_arrow(device: str, array: pa.StructArray, dtype: dt.Struct):
+        # pyre-fixme[16]: `StructArray` has no attribute `type`.
+        assert array.type.num_fields == len(dtype.fields)
+
+        from pyarrow.cffi import ffi
+
+        c_schema = ffi.new("struct ArrowSchema*")
+        ptr_schema = int(ffi.cast("uintptr_t", c_schema))
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+        # pyre-fixme[16]: `Array` has no attribute `_export_to_c`.
+        array._export_to_c(ptr_array, ptr_schema)
+
+        velox_column = velox._import_from_arrow(
+            get_velox_type(dtype), ptr_array, ptr_schema
+        )
+
+        # Make sure the ownership of c_schema and c_array have been transferred
+        # to velox_column
+        assert c_schema.release == ffi.NULL and c_array.release == ffi.NULL
+
+        return ColumnCpuMixin._from_velox(
+            device,
+            dtype,
+            velox_column,
+            True,
+        )
+
     def _append_null(self):
-        if self._finialized:
-            raise AttributeError("It is already finialized.")
+        if self._finalized:
+            raise AttributeError("It is already finalized.")
         df = self.append([None])
         self._data = df._data
 
     def _append_value(self, value):
-        if self._finialized:
-            raise AttributeError("It is already finialized.")
+        if self._finalized:
+            raise AttributeError("It is already finalized.")
         df = self.append([value])
         self._data = df._data
 
     def _finalize(self):
-        self._finialized = True
+        self._finalized = True
         return self
 
     def _fromdata(
-        self, field_data: OrderedDict[str, IColumn], mask: Optional[Iterable[bool]]
-    ):
+        self, field_data: OrderedDict[str, Column], mask: Optional[Iterable[bool]]
+    ) -> DataFrameCpu:
         dtype = dt.Struct(
             [dt.Field(n, c.dtype) for n, c in field_data.items()],
             nullable=self.dtype.nullable,
         )
         col = velox.Column(get_velox_type(dtype))
         for n, c in field_data.items():
+            # pyre-fixme[16]: `Column` has no attribute `_data`.
             col.set_child(col.type().get_child_idx(n), c._data)
             col.set_length(len(c._data))
+
         if mask is not None:
             mask_list = list(mask)
             assert len(field_data) == 0 or len(mask_list) == len(col)
@@ -153,7 +222,8 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                 if mask_list[i]:
                     col.set_null_at(i)
 
-        return ColumnFromVelox.from_velox(self.device, dtype, col, True)
+        # pyre-fixme[7]: Expected `DataFrameCpu` but got `Column`.
+        return ColumnCpuMixin._from_velox(self.device, dtype, col, True)
 
     def __len__(self):
         return len(self._data)
@@ -172,7 +242,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             i += len(self._data)
         if not self._getmask(i):
             return tuple(
-                ColumnFromVelox.from_velox(
+                ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[j].dtype,
                     self._data.child_at(j),
@@ -188,10 +258,9 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         return np.full((ct,), False, dtype=np.bool8)
 
     def copy(self):
-        return ColumnFromVelox.from_velox(self.device, self.dtype, self._data, True)
+        return ColumnCpuMixin._from_velox(self.device, self.dtype, self._data, True)
 
     def append(self, values: Iterable[Union[None, dict, tuple]]):
-        """Returns column/dataframe with values appended."""
         it = iter(values)
 
         try:
@@ -213,11 +282,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                     idx = self._data.type().get_child_idx(k)
                     child = self._data.child_at(idx)
                     dtype = self.dtype.fields[idx].dtype
-                    child_col = ColumnFromVelox.from_velox(
+                    child_col = ColumnCpuMixin._from_velox(
                         self.device, dtype, child, True
                     )
                     child_col = child_col.append([v])
                     res[k] = child_col
+                # pyre-fixme[6]: For 1st param expected `OrderedDict[str, Column]`
+                #  but got `Dict[typing.Any, typing.Any]`.
                 new_data = self._fromdata(res, self._mask + [False])
 
                 return new_data.append(it)
@@ -227,10 +298,19 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                 return self.append(
                     [{f.name: v for f, v in zip(self.dtype.fields, value)}]
                 ).append(it)
+
+            else:
+                raise TypeError(
+                    f"Unexpected value type to append to DataFrame: {type(value).__name__}, the value being appended is: {value}"
+                )
+
         except StopIteration:
             return self
 
     def _check_columns(self, columns: Iterable[str]):
+        if isinstance(columns, str):
+            raise TypeError(f"columns should be Iterable of str but not str")
+
         valid_names = {f.name for f in self.dtype.fields}
         for n in columns:
             if n not in valid_names:
@@ -238,16 +318,42 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     # implementing abstract methods ----------------------------------------------
 
-    def _set_field_data(self, name: str, col: IColumn, empty_df: bool):
+    @trace
+    def __setitem__(self, name: str, value: Any) -> None:
+        if isinstance(value, Column):
+            assert self.device == value.device
+            col = value
+        else:
+            col = ta.column(value)
+
+        empty_df = len(self.dtype.fields) == 0
+
+        # Update dtype
+        idx = self.dtype.get_index(name)
+        if idx is None:
+            # append column
+            new_fields = self.dtype.fields + [dt.Field(name, col.dtype)]
+        else:
+            # override column
+            new_fields = list(self.dtype.fields)
+            new_fields[idx] = dt.Field(name, col.dtype)
+        self._dtype = dt.Struct(fields=new_fields)
+
+        # Update field data
+        self._set_field_data(name, col, empty_df)
+
+    def _set_field_data(self, name: str, col: Column, empty_df: bool):
         if not empty_df and len(col) != len(self):
             raise TypeError("all columns/lists must have equal length")
 
+        # pyre-fixme[16]: `DType` has no attribute `get_index`.
         column_idx = self._dtype.get_index(name)
         new_delegate = velox.Column(get_velox_type(self._dtype))
+        # pyre-fixme[16]: `Column` has no attribute `_data`.
         new_delegate.set_length(len(col._data))
 
         # Set columns for new_delegate
-        for idx in range(len(self._dtype.fields)):
+        for idx in range(len(self.dtype.fields)):
             if idx != column_idx:
                 new_delegate.set_child(idx, self._data.child_at(idx))
             else:
@@ -289,7 +395,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         return self._fromdata(
             {
                 self.dtype.fields[i]
-                .name: ColumnFromVelox.from_velox(
+                .name: ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -301,30 +407,30 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             mask,
         )
 
-    def get_column(self, column):
+    def _get_column(self, column):
         idx = self._data.type().get_child_idx(column)
-        return ColumnFromVelox.from_velox(
+        return ColumnCpuMixin._from_velox(
             self.device,
             self.dtype.fields[idx].dtype,
             self._data.child_at(idx),
             True,
         )
 
-    def get_columns(self, columns):
+    def _get_columns(self, columns):
         # TODO: decide on nulls, here we assume all defined (mask = False) for new parent...
         res = {}
         for n in columns:
-            res[n] = self.get_column(n)
+            res[n] = self._get_column(n)
         return self._fromdata(res, self._mask)
 
-    def slice_columns(self, start, stop):
+    def _slice_columns(self, start, stop):
         # TODO: decide on nulls, here we assume all defined (mask = False) for new parent...
         _start = 0 if start is None else self._column_index(start)
         _stop = len(self.columns) if stop is None else self._column_index(stop)
         res = {}
         for i in range(_start, _stop):
             m = self.columns[i]
-            res[m] = ColumnFromVelox.from_velox(
+            res[m] = ColumnCpuMixin._from_velox(
                 self.device,
                 self.dtype.fields[i].dtype,
                 self._data.child_at(i),
@@ -339,76 +445,84 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def map(
         self,
         arg: Union[Dict, Callable],
-        /,
-        na_action: Literal["ignore", None] = None,
+        na_action=None,
         dtype: Optional[dt.DType] = None,
         columns: Optional[List[str]] = None,
     ):
-        """
-        Maps rows according to input correspondence.
-        dtype required if result type != item type.
-        """
-
         if columns is None:
+            # pyre-fixme[16]: `ColumnCpuMixin` has no attribute `map`.
             return super().map(arg, na_action, dtype)
         self._check_columns(columns)
 
         if len(columns) == 1:
             idx = self._data.type().get_child_idx(columns[0])
-            return ColumnFromVelox.from_velox(
+            return ColumnCpuMixin._from_velox(
                 self.device,
                 self.dtype.fields[idx].dtype,
                 self._data.child_at(idx),
                 True,
             ).map(arg, na_action, dtype)
-        else:
-            if not isinstance(arg, dict) and dtype is None:
-                (dtype, _) = dt.infer_dype_from_callable_hint(arg)
-            dtype = dtype or self._dtype
 
-            def func(*x):
-                return arg.get(tuple(*x), None) if isinstance(arg, dict) else arg(*x)
+        if not isinstance(arg, dict) and dtype is None:
+            (dtype, _) = dt.infer_dype_from_callable_hint(arg)
+        dtype = dtype or self._dtype
 
-            cols = []
-            for n in columns:
-                idx = self._data.type().get_child_idx(n)
-                cols.append(
-                    ColumnFromVelox.from_velox(
-                        self.device,
-                        self.dtype.fields[idx].dtype,
-                        self._data.child_at(idx),
-                        True,
-                    )
+        cols = []
+        for n in columns:
+            idx = self._data.type().get_child_idx(n)
+            cols.append(
+                ColumnCpuMixin._from_velox(
+                    self.device,
+                    self.dtype.fields[idx].dtype,
+                    self._data.child_at(idx),
+                    True,
                 )
+            )
 
-            res = Scope.default._EmptyColumn(dtype)
-            for i in range(len(self)):
-                if self.is_valid_at(i):
-                    res._append(func(*[col[i] for col in cols]))
-                elif na_action is None:
-                    res._append(func(None))
-                else:
-                    res._append(None)
-            return res._finalize()
+        # Faster path (for the very slow python path)
+        if all([col.null_count == 0 for col in cols]) and not (isinstance(arg, dict)):
+            res = []
+            dcols = [col._data for col in cols]
+            if len(dcols) == 2:
+                a, b = dcols[0], dcols[1]
+                res = [arg(a[i], b[i]) for i in range(len(a))]
+            elif len(dcols) == 3:
+                a, b, c = dcols[0], dcols[1], dcols[2]
+                res = [arg(a[i], b[i], c[i]) for i in range(len(a))]
+            else:
+                res = [arg(*[dcol[i] for dcol in dcols]) for i in range(len(dcols[0]))]
+            return Scope._FromPySequence(res, dtype)
+
+        # Slow path for very slow path
+        def func(*x):
+            return arg.get(tuple(*x), None) if isinstance(arg, dict) else arg(*x)
+
+        res = []
+        for i in range(len(self)):
+            if all([col.is_valid_at(i) for col in cols]) or (na_action is None):
+                res.append(func(*[col[i] for col in cols]))
+            elif na_action == "ignore":
+                res.append(None)
+            else:
+                raise TypeError(f"na_action has unsupported value {na_action}")
+        return Scope._FromPySequence(res, dtype)
 
     @trace
     @expression
     def flatmap(
         self,
         arg: Union[Dict, Callable],
-        na_action: Literal["ignore", None] = None,
+        na_action=None,
         dtype: Optional[dt.DType] = None,
         columns: Optional[List[str]] = None,
     ):
-        """
-        Maps rows to list of rows according to input correspondence
-        dtype required if result type != item type.
-        """
         if columns is None:
+            # pyre-fixme[16]: `ColumnCpuMixin` has no attribute `flatmap`.
             return super().flatmap(arg, na_action, dtype)
         self._check_columns(columns)
 
         if len(columns) == 1:
+            # pyre-fixme[16]: `DataFrameCpu` has no attribute `_field_data`.
             return self._field_data[columns[0]].flatmap(
                 arg,
                 na_action,
@@ -423,6 +537,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             cols = [self._field_data[n] for n in columns]
             res = Scope._EmptyColumn(dtype_)
             for i in range(len(self)):
+                # pyre-fixme[16]: `DataFrameCpu` has no attribute `valid`.
                 if self.valid(i):
                     res._extend(func(*[col[i] for col in cols]))
                 elif na_action is None:
@@ -436,32 +551,8 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def filter(
         self, predicate: Union[Callable, Iterable], columns: Optional[List[str]] = None
     ):
-        """
-        Select rows where predicate is True.
-        Different from Pandas. Use keep for Pandas filter.
-
-        Parameters
-        ----------
-        predicate - callable or iterable
-            A predicate function or iterable of booleans the same
-            length as the column.  If an n-ary predicate, use the
-            columns parameter to provide arguments.
-        columns - list of string names, default None
-            Which columns to invoke the filter with.  If None, apply to
-            all columns.
-
-        See Also
-        --------
-        map, reduce, flatmap
-
-        Examples
-        --------
-        >>> ta.Column([1,2,3,4]).filter([True, False, True, False]) == ta.Column([1,2,3,4]).filter(lambda x: x%2==1)
-        0  1
-        1  1
-        dtype: boolean, length: 2, null_count: 0
-        """
         if columns is None:
+            # pyre-fixme[16]: `ColumnCpuMixin` has no attribute `filter`.
             return super().filter(predicate)
 
         self._check_columns(columns)
@@ -476,7 +567,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         for n in columns:
             idx = self._data.type().get_child_idx(n)
             cols.append(
-                ColumnFromVelox.from_velox(
+                ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[idx].dtype,
                     self._data.child_at(idx),
@@ -503,9 +594,8 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         self,
         by: Optional[List[str]] = None,
         ascending=True,
-        na_position: Literal["last", "first"] = "last",
+        na_position="last",
     ):
-        """Sort a column/a dataframe in ascending or descending order"""
         # Not allowing None in comparison might be too harsh...
         # Move all rows with None that in sort index to back...
         func = None
@@ -529,29 +619,6 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             res._extend([None] * self.null_count)
         return res._finalize()
 
-    @trace
-    @expression
-    def _nlargest(
-        self,
-        n=5,
-        columns: Optional[List[str]] = None,
-        keep: Literal["last", "first"] = "first",
-    ):
-        """Returns a new dataframe of the *n* largest elements."""
-        # Todo add keep arg
-        return self.sort(by=columns, ascending=False).head(n)
-
-    @trace
-    @expression
-    def _nsmallest(
-        self,
-        n=5,
-        columns: Optional[List[str]] = None,
-        keep: Literal["last", "first"] = "first",
-    ):
-        """Returns a new dataframe of the *n* smallest elements."""
-        return self.sort(by=columns, ascending=True).head(n)
-
     # operators --------------------------------------------------------------
 
     @expression
@@ -560,13 +627,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    + ColumnFromVelox.from_velox(
+                    + ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -579,7 +646,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -601,7 +668,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             return self._fromdata(
                 {
                     self.dtype.fields[i].name: other
-                    + ColumnFromVelox.from_velox(
+                    + ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -618,13 +685,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    - ColumnFromVelox.from_velox(
+                    - ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -637,7 +704,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -655,13 +722,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
                         True,
                     )
-                    - ColumnFromVelox.from_velox(
+                    - ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -675,7 +742,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             return self._fromdata(
                 {
                     self.dtype.fields[i].name: other
-                    - ColumnFromVelox.from_velox(
+                    - ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -692,13 +759,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    * ColumnFromVelox.from_velox(
+                    * ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -711,7 +778,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -729,13 +796,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
                         True,
                     )
-                    * ColumnFromVelox.from_velox(
+                    * ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -749,7 +816,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             return self._fromdata(
                 {
                     self.dtype.fields[i].name: other
-                    * ColumnFromVelox.from_velox(
+                    * ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -766,13 +833,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    // ColumnFromVelox.from_velox(
+                    // ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -785,7 +852,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -803,13 +870,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
                         True,
                     )
-                    // ColumnFromVelox.from_velox(
+                    // ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -823,7 +890,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             return self._fromdata(
                 {
                     self.dtype.fields[i].name: other
-                    // ColumnFromVelox.from_velox(
+                    // ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -840,13 +907,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    / ColumnFromVelox.from_velox(
+                    / ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -859,7 +926,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -883,13 +950,29 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @expression
     def __mod__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: c % other[n] for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    % ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -904,11 +987,39 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @expression
     def __rmod__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: other[n] % c for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    % ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
-            return self._fromdata({n: other % c for (n, c) in self._field_data.items()})
+            return self._fromdata(
+                {
+                    self.dtype.fields[i].name: other
+                    % ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
+            )
 
     @expression
     def __pow__(self, other):
@@ -916,13 +1027,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    ** ColumnFromVelox.from_velox(
+                    ** ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -935,7 +1046,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -953,13 +1064,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
                         True,
                     )
-                    ** ColumnFromVelox.from_velox(
+                    ** ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -973,7 +1084,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             return self._fromdata(
                 {
                     self.dtype.fields[i].name: other
-                    ** ColumnFromVelox.from_velox(
+                    ** ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -990,13 +1101,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    == ColumnFromVelox.from_velox(
+                    == ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -1009,7 +1120,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1025,11 +1136,21 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def __ne__(self, other):
         if isinstance(other, DataFrameCpu):
             return self._fromdata(
-                {n: c == other[n] for (n, c) in self._field_data.items()}
+                {n: c != other[n] for (n, c) in self._field_data.items()}
             )
         else:
             return self._fromdata(
-                {n: c == other for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: other
+                    != ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
 
     @expression
@@ -1038,13 +1159,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    < ColumnFromVelox.from_velox(
+                    < ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -1057,7 +1178,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1075,13 +1196,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    > ColumnFromVelox.from_velox(
+                    > ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -1094,7 +1215,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1108,13 +1229,29 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     def __le__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: c <= other[n] for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    <= ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1131,13 +1268,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             assert len(self) == len(other)
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
                         True,
                     )
-                    >= ColumnFromVelox.from_velox(
+                    >= ColumnCpuMixin._from_velox(
                         other.device,
                         other.dtype.fields[i].dtype,
                         other._data.child_at(i),
@@ -1149,18 +1286,44 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             )
         else:
             return self._fromdata(
-                {n: c >= other for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    >= other
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
 
     def __or__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: c | other[n] for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    | ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
             return self._fromdata(
                 {
-                    self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1174,27 +1337,111 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     def __ror__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: other[n] | c for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    | ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
-            return self._fromdata({n: other | c for (n, c) in self._field_data.items()})
+            return self._fromdata(
+                {
+                    self.dtype.fields[i].name: other
+                    | ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
+            )
 
     def __and__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: c & other[n] for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    & ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
-            return self._fromdata({n: c & other for (n, c) in self._field_data.items()})
+            return self._fromdata(
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    & other
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
+            )
 
     def __rand__(self, other):
         if isinstance(other, DataFrameCpu):
+            assert len(self) == len(other)
             return self._fromdata(
-                {n: other[n] & c for (n, c) in self._field_data.items()}
+                {
+                    self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
+                        other.device,
+                        other.dtype.fields[i].dtype,
+                        other._data.child_at(i),
+                        True,
+                    )
+                    & ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
             )
         else:
-            return self._fromdata({n: other & c for (n, c) in self._field_data.items()})
+            return self._fromdata(
+                {
+                    self.dtype.fields[i].name: other
+                    & ColumnCpuMixin._from_velox(
+                        self.device,
+                        self.dtype.fields[i].dtype,
+                        self._data.child_at(i),
+                        True,
+                    )
+                    for i in range(self._data.children_size())
+                },
+                self._mask,
+            )
 
     def __invert__(self):
         return self._fromdata({n: ~c for (n, c) in self._field_data.items()})
@@ -1202,7 +1449,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def __neg__(self):
         return self._fromdata(
             {
-                self.dtype.fields[i].name: -ColumnFromVelox.from_velox(
+                self.dtype.fields[i].name: -ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1216,7 +1463,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def __pos__(self):
         return self._fromdata(
             {
-                self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1227,17 +1474,34 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             self._mask,
         )
 
+    def log(self) -> DataFrameCpu:
+        return self._fromdata(
+            # pyre-fixme[6]: Incompatible parameter type [6]: In call `DataFrameCpu._fromdata`, for 1st positional only parameter expected `OrderedDict[str, Column]` but got `Dict[str, typing.Any]`
+            {
+                self.dtype.fields[i]
+                # pyre-fixme[16]: `Column` has no attribute `log`.
+                .name: ColumnCpuMixin._from_velox(
+                    self.device,
+                    self.dtype.fields[i].dtype,
+                    self._data.child_at(i),
+                    True,
+                ).log()
+                for i in range(self._data.children_size())
+            },
+            mask=(None if self.null_count == 0 else self._mask),
+        )
+
     # isin ---------------------------------------------------------------
 
     @trace
     @expression
-    def isin(self, values: Union[list, dict, IColumn]):
-        """Check whether values are contained in data."""
+    def isin(self, values: Union[list, dict, Column]):
         if isinstance(values, list):
             return self._fromdata(
+                # pyre-fixme[6]: Incompatible parameter type [6]: In call `DataFrameCpu._fromdata`, for 1st positional only parameter expected `OrderedDict[str, Column]` but got `Dict[str, typing.Any]`
                 {
                     self.dtype.fields[i]
-                    .name: ColumnFromVelox.from_velox(
+                    .name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1250,11 +1514,14 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
             )
         if isinstance(values, dict):
             self._check_columns(values.keys())
+            # pyre-fixme[20]: Argument `mask` expected.
             return self._fromdata(
+                # pyre-fixme[16]: `DataFrameCpu` has no attribute `_field_data`.
                 {n: c.isin(values[n]) for n, c in self._field_data.items()}
             )
-        if isinstance(values, IDataFrame):
+        if isinstance(values, DataFrame):
             self._check_columns(values.columns)
+            # pyre-fixme[20]: Argument `mask` expected.
             return self._fromdata(
                 {n: c.isin(values=list(values[n])) for n, c in self._field_data.items()}
             )
@@ -1267,14 +1534,15 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     @trace
     @expression
-    def fill_null(self, fill_value: Union[dt.ScalarTypes, Dict, Literal[None]]):
+    def fill_null(self, fill_value: Optional[Union[dt.ScalarTypes, Dict]]):
         if fill_value is None:
             return self
-        if isinstance(fill_value, IColumn._scalar_types):
+        if isinstance(fill_value, Column._scalar_types):
             return self._fromdata(
+                # pyre-fixme[6]: Incompatible parameter type [6]: In call `DataFrameCpu._fromdata`, for 1st positional only parameter expected `OrderedDict[str, Column]` but got `Dict[str, typing.Any]`
                 {
                     self.dtype.fields[i]
-                    .name: ColumnFromVelox.from_velox(
+                    .name: ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1290,8 +1558,10 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     @trace
     @expression
-    def drop_null(self, how: Literal["any", "all"] = "any"):
+    def drop_null(self, how="any"):
         """Return a dataframe with rows removed where the row has any or all nulls."""
+        self._prototype_support_warning("drop_null")
+
         # TODO only flat columns supported...
         assert self._dtype is not None
         res = Scope._EmptyColumn(self._dtype.constructor(nullable=False))
@@ -1309,10 +1579,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @expression
     def drop_duplicates(
         self,
-        subset: Optional[List[str]] = None,
-        keep: Literal["first", "last", False] = "first",
+        subset: Optional[Union[str, List[str]]] = None,
+        keep="first",
     ):
-        """Remove duplicate values from data but keep the first, last, none (keep=False)"""
+        self._prototype_support_warning("drop_duplicates")
+
+        if isinstance(subset, str):
+            subset = [subset]
         columns = subset if subset is not None else self.columns
         self._check_columns(columns)
 
@@ -1367,7 +1640,6 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @trace
     @expression
     def min(self):
-        """Return the minimum of the non-null values of the Column."""
         return self._summarize(DataFrameCpu._cmin)
 
     # with dataclass function
@@ -1385,91 +1657,76 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @trace
     @expression
     def max(self):
-        """Return the maximum of the non-null values of the column."""
         # skipna == True
         return self._summarize(lambda c: c.max)
 
     @trace
     @expression
     def all(self):
-        """Return whether all non-null elements are True in Column"""
         return self._summarize(lambda c: c.all)
 
     @trace
     @expression
     def any(self):
-        """Return whether any non-null element is True in Column"""
         return self._summarize(lambda c: c.any)
 
     @trace
     @expression
     def sum(self):
-        """Return sum of all non-null elements in Column"""
         return self._summarize(lambda c: c.sum)
 
     @trace
     @expression
-    def prod(self):
-        """Return produce of the values in the data"""
-        return self._summarize(lambda c: c.prod)
-
-    @trace
-    @expression
-    def cummin(self):
-        """Return cumulative minimum of the data."""
-        return self._lift(lambda c: c.cummin)
-
-    @trace
-    @expression
-    def cummax(self):
-        """Return cumulative maximum of the data."""
-        return self._lift(lambda c: c.cummax)
-
-    @trace
-    @expression
-    def cumsum(self):
-        """Return cumulative sum of the data."""
-        return self._lift(lambda c: c.cumsum)
-
-    @trace
-    @expression
-    def cumprod(self):
-        """Return cumulative product of the data."""
-        return self._lift(lambda c: c.cumprod)
-
-    @trace
-    @expression
     def mean(self):
-        """Return the mean of the values in the series."""
         return self._summarize(lambda c: c.mean)
 
     @trace
     @expression
     def median(self):
-        """Return the median of the values in the data."""
         return self._summarize(lambda c: c.median)
 
     @trace
     @expression
     def mode(self):
-        """Return the mode(s) of the data."""
         return self._summarize(lambda c: c.mode)
 
     @trace
     @expression
     def std(self):
-        """Return the stddev(s) of the data."""
         return self._summarize(lambda c: c.std)
+
+    @trace
+    @expression
+    def _cummin(self):
+        """Return cumulative minimum of the data."""
+        return self._lift(lambda c: c._cummin)
+
+    @trace
+    @expression
+    def _cummax(self):
+        """Return cumulative maximum of the data."""
+        return self._lift(lambda c: c._cummax)
+
+    @trace
+    @expression
+    def cumsum(self):
+        return self._lift(lambda c: c.cumsum)
+
+    @trace
+    @expression
+    def _cumprod(self):
+        """Return cumulative product of the data."""
+        return self._lift(lambda c: c._cumprod)
 
     @trace
     @expression
     def _nunique(self, drop_null=True):
         """Returns the number of unique values per column"""
         res = {}
-        res["column"] = ta.Column([f.name for f in self.dtype.fields], dt.string)
-        res["unique"] = ta.Column(
+        res["column"] = ta.column([f.name for f in self.dtype.fields], dt.string)
+        res["unique"] = ta.column(
             [
-                ColumnFromVelox.from_velox(
+                ColumnCpuMixin._from_velox(
                     self.device,
                     f.dtype,
                     self._data.child_at(self._data.type().get_child_idx(f.name)),
@@ -1482,11 +1739,11 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         return self._fromdata(res, None)
 
     def _summarize(self, func):
-        res = ta.Column(self.dtype)
+        res = ta.column(self.dtype)
 
         for i in range(self._data.children_size()):
             result = func(
-                ColumnFromVelox.from_velox(
+                ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1507,7 +1764,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
             for i in range(self._data.children_size()):
                 child = func(
-                    ColumnFromVelox.from_velox(
+                    ColumnCpuMixin._from_velox(
                         self.device,
                         self.dtype.fields[i].dtype,
                         self._data.child_at(i),
@@ -1519,7 +1776,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                     child._data,
                 )
             res.set_length(len(self._data))
-            return ColumnFromVelox.from_velox(self.device, self.dtype, res, True)
+            return ColumnCpuMixin._from_velox(self.device, self.dtype, res, True)
         raise NotImplementedError("Dataframe row is not allowed to have nulls")
 
     # describe ----------------------------------------------------------------
@@ -1529,29 +1786,28 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     def describe(
         self,
         percentiles=None,
-        include_columns=None,
-        exclude_columns=None,
+        include=None,
+        exclude=None,
     ):
-        """Generate descriptive statistics."""
         # Not supported: datetime_is_numeric=False,
         includes = []
-        if include_columns is None:
+        if include is None:
             includes = [f.name for f in self.dtype.fields if dt.is_numerical(f.dtype)]
-        elif isinstance(include_columns, list):
-            includes = [f.name for f in self.dtype.fields if f.dtype in include_columns]
+        elif isinstance(include, list):
+            includes = [f.name for f in self.dtype.fields if f.dtype in include]
         else:
             raise TypeError(
-                f"describe with include_columns of type {type(include_columns).__name__} is not supported"
+                f"describe with include of type {type(include).__name__} is not supported"
             )
 
         excludes = []
-        if exclude_columns is None:
+        if exclude is None:
             excludes = []
-        elif isinstance(exclude_columns, list):
-            excludes = [f.name for f in self.dtype.fields if f.dtype in exclude_columns]
+        elif isinstance(exclude, list):
+            excludes = [f.name for f in self.dtype.fields if f.dtype in exclude]
         else:
             raise TypeError(
-                f"describe with exclude_columns of type {type(exclude_columns).__name__} is not supported"
+                f"describe with exclude of type {type(exclude).__name__} is not supported"
             )
         selected = [i for i in includes if i not in excludes]
 
@@ -1563,20 +1819,20 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                 raise ValueError("percentiles must be betwen 0 and 100")
 
         res = {}
-        res["metric"] = ta.Column(
+        res["metric"] = ta.column(
             ["count", "mean", "std", "min"] + [f"{p}%" for p in percentiles] + ["max"]
         )
         for s in selected:
             idx = self._data.type().get_child_idx(s)
-            c = ColumnFromVelox.from_velox(
+            c = ColumnCpuMixin._from_velox(
                 self.device,
                 self.dtype.fields[idx].dtype,
                 self._data.child_at(idx),
                 True,
             )
-            res[s] = ta.Column(
+            res[s] = ta.column(
                 [c._count(), c.mean(), c.std(), c.min()]
-                + c.quantile(percentiles, "midpoint")
+                + c.percentile(percentiles, "midpoint")
                 + [c.max()]
             )
         return self._fromdata(res, [False] * len(res["metric"]))
@@ -1585,14 +1841,14 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     @trace
     @expression
-    def drop(self, columns: List[str]):
-        """
-        Returns DataFrame without the removed columns.
-        """
+    def drop(self, columns: Union[str, List[str]]):
+        if isinstance(columns, str):
+            columns = [columns]
         self._check_columns(columns)
         return self._fromdata(
+            # pyre-fixme[6]: Incompatible parameter type [6]: In call `DataFrameCpu._fromdata`, for 1st positional only parameter expected `OrderedDict[str, Column]` but got `Dict[str, typing.Any]`
             {
-                self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1606,14 +1862,15 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     @trace
     @expression
-    def keep(self, columns: List[str]):
+    def _keep(self, columns: List[str]):
         """
         Returns DataFrame with the kept columns only.
         """
         self._check_columns(columns)
         return self._fromdata(
+            # pyre-fixme[6]: Incompatible parameter type [6]: In call `DataFrameCpu._fromdata`, for 1st positional only parameter expected `OrderedDict[str, Column]` but got `Dict[str, typing.Any]`
             {
-                self.dtype.fields[i].name: ColumnFromVelox.from_velox(
+                self.dtype.fields[i].name: ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1627,13 +1884,16 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
 
     @trace
     @expression
-    def rename(self, column_mapper: Dict[str, str]):
-        self._check_columns(column_mapper.keys())
+    def rename(self, mapper: Dict[str, str]):
+        self._check_columns(mapper.keys())
         return self._fromdata(
+            # pyre-fixme[6]: For 1st param expected `OrderedDict[str, Column]` but
+            #  got `Dict[str, Column]`.
             {
-                column_mapper.get(
-                    self.dtype.fields[i].name, self.dtype.fields[i].name
-                ): ColumnFromVelox.from_velox(
+                mapper.get(
+                    self.dtype.fields[i].name,
+                    self.dtype.fields[i].name,
+                ): ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1647,13 +1907,12 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @trace
     @expression
     def reorder(self, columns: List[str]):
-        """
-        Returns DataFrame with the columns in the prescribed order.
-        """
         self._check_columns(columns)
         return self._fromdata(
+            # pyre-fixme[6]: For 1st param expected `OrderedDict[str, Column]` but
+            #  got `Dict[str, Column]`.
             {
-                col: ColumnFromVelox.from_velox(
+                col: ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[self._data.type().get_child_idx(col)].dtype,
                     self._data.child_at(self._data.type().get_child_idx(col)),
@@ -1667,35 +1926,87 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     # interop ----------------------------------------------------------------
 
     def to_pandas(self):
-        """Convert self to pandas dataframe"""
         # TODO Add type translation.
         # Skipping analyzing 'pandas': found module but no type hints or library stubs
         import pandas as pd  # type: ignore
 
-        map = {}
+        data = {}
         for n, c in self._field_data.items():
-            map[n] = c.to_pandas()
-        return pd.DataFrame(map)
+            data[n] = c.to_pandas()
+        return pd.DataFrame(data)
 
     def to_arrow(self):
-        """Convert self to arrow table"""
+        return self._to_arrow_table()
+
+    def _to_arrow_array(self):
+        import pyarrow as pa
+        from pyarrow.cffi import ffi
+        from torcharrow._interop import _dtype_to_arrowtype
+
+        c_array = ffi.new("struct ArrowArray*")
+        ptr_array = int(ffi.cast("uintptr_t", c_array))
+        self._data._export_to_arrow(ptr_array)
+
+        return pa.StructArray._import_from_c(ptr_array, _dtype_to_arrowtype(self.dtype))
+
+    def _to_arrow_table(self):
         # TODO Add type translation
         import pyarrow as pa  # type: ignore
 
-        map = {}
-        for n, c in self._field_data.items():
-            map[n] = c.to_arrow()
-        return pa.table(map)
+        data = {}
+        fields = []
+        for i in range(0, self._data.children_size()):
+            name = self.dtype.fields[i].name
+            column = ColumnCpuMixin._from_velox(
+                self.device,
+                self.dtype.fields[i].dtype,
+                self._data.child_at(i),
+                True,
+            )
 
-    def to_torch(self):
+            if dt.is_struct(column.dtype):
+                arrow_array = column._to_arrow_array()
+            else:
+                arrow_array = column.to_arrow()
+            data[name] = arrow_array
+            fields.append(
+                pa.field(name, arrow_array.type, nullable=column.dtype.nullable)
+            )
+
+        return pa.table(data, schema=pa.schema(fields))
+
+    def to_tensor(self, conversion=None):
         pytorch.ensure_available()
-        import torch
 
+        conversion = conversion or {}
+        # TODO: Deprecate pytorch.ITorchConversion with predefined Final[Callable]
+        if isinstance(conversion, pytorch.TensorConversion):
+            return conversion.to_tensor(self)
+        if callable(conversion):
+            return conversion(self)
+
+        assert isinstance(conversion, dict)
         # TODO: this actually puts the type annotations on the tuple wrong.
         # We might need to address it eventually, but because it's Python it doesn't matter
         tup_type = self._dtype.py_type
 
-        return tup_type(*(self[f.name].to_torch() for f in self.dtype.fields))
+        conversions = [
+            conversion.get(f.name, pytorch.DefaultTensorConversion())
+            for f in self.dtype.fields
+        ]
+        conversion_funcs = [
+            c.to_tensor if isinstance(c, pytorch.TensorConversion) else c
+            for c in conversions
+        ]
+        return tup_type(
+            *(
+                conversion_funcs[idx](self[f.name])
+                for idx, f in enumerate(self.dtype.fields)
+            )
+        )
+
+    def _to_tensor_default(self):
+        return self.to_tensor()
 
     # fluent with symbolic expressions ----------------------------------------
 
@@ -1703,39 +2014,6 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @trace
     @expression
     def where(self, *conditions):
-        """
-        Analogous to SQL's where (NOT Pandas where)
-
-        Filter a dataframe to only include rows satisfying a given set
-        of conditions. df.where(p) is equivalent to writing df[p].
-
-        Examples
-        --------
-
-        >>> from torcharrow import ta
-        >>> xf = ta.DataFrame({
-        >>>    'A':['a', 'b', 'a', 'b'],
-        >>>    'B': [1, 2, 3, 4],
-        >>>    'C': [10,11,12,13]})
-        >>> xf.where(xf['B']>2)
-          index  A      B    C
-        -------  ---  ---  ---
-              0  a      3   12
-              1  b      4   13
-        dtype: Struct([Field('A', string), Field('B', int64), Field('C', int64)]), count: 2, null_count: 0
-
-        When referring to self in an expression, the special value `me` can be
-        used.
-
-        >>> from torcharrow import me
-        >>> xf.where(me['B']>2)
-          index  A      B    C
-        -------  ---  ---  ---
-              0  a      3   12
-              1  b      4   13
-        dtype: Struct([Field('A', string), Field('B', int64), Field('C', int64)]), count: 2, null_count: 0
-        """
-
         if len(conditions) == 0:
             return self
 
@@ -1750,55 +2028,11 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @trace
     @expression
     def select(self, *args, **kwargs):
-        """
-        Analogous to SQL's ``SELECT`.
-
-        Transform a dataframe by selecting old columns and new (computed)
-        columns.
-
-        args - positional string arguments
-            Column names to keep in the projection. A column name of "*" is a
-            shortcut to denote all columns. A column name beginning with "-"
-            means remove this column.
-
-        kwargs - named value arguments
-            New column name expressions to add to the projection
-
-        The special symbol me can  be used to refer to self.
-
-        Examples
-        --------
-        >>> from torcharrow import ta
-        >>> xf = ta.DataFrame({
-        >>>    'A': ['a', 'b', 'a', 'b'],
-        >>>    'B': [1, 2, 3, 4],
-        >>>    'C': [10,11,12,13]})
-        >>> xf.select(*xf.columns,D=me['B']+me['C'])
-          index  A      B    C    D
-        -------  ---  ---  ---  ---
-              0  a      1   10   11
-              1  b      2   11   13
-              2  a      3   12   15
-              3  b      4   13   17
-        dtype: Struct([Field('A', string), Field('B', int64), Field('C', int64), Field('D', int64)]), count: 4, null_count: 0
-
-        Using '*' and '-colname':
-
-        >>> xf.select('*','-B',D=me['B']+me['C'])
-          index  A      C    D
-        -------  ---  ---  ---
-              0  a     10   11
-              1  b     11   13
-              2  a     12   15
-              3  b     13   17
-        dtype: Struct([Field('A', string), Field('C', int64), Field('D', int64)]), count: 4, null_count: 0
-        """
-
         input_columns = set(self.columns)
 
         has_star = False
-        include_columns = []
-        exclude_columns = []
+        include = []
+        exclude = []
         for arg in args:
             if not isinstance(arg, str):
                 raise TypeError("args must be column names")
@@ -1807,39 +2041,37 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
                     raise ValueError("select received repeated stars")
                 has_star = True
             elif arg in input_columns:
-                if arg in include_columns:
+                if arg in include:
                     raise ValueError(
                         f"select received a repeated column-include ({arg})"
                     )
-                include_columns.append(arg)
+                include.append(arg)
             elif arg[0] == "-" and arg[1:] in input_columns:
-                if arg in exclude_columns:
+                if arg in exclude:
                     raise ValueError(
                         f"select received a repeated column-exclude ({arg[1:]})"
                     )
-                exclude_columns.append(arg[1:])
+                exclude.append(arg[1:])
             else:
                 raise ValueError(f"argument ({arg}) does not denote an existing column")
-        if exclude_columns and not has_star:
+        if exclude and not has_star:
             raise ValueError("select received column-exclude without a star")
-        if has_star and include_columns:
+        if has_star and include:
             raise ValueError("select received both a star and column-includes")
-        if set(include_columns) & set(exclude_columns):
+        if set(include) & set(exclude):
             raise ValueError(
                 "select received overlapping column-includes and " + "column-excludes"
             )
 
-        include_columns_inc_star = self.columns if has_star else include_columns
+        include_inc_star = self.columns if has_star else include
 
-        output_columns = [
-            col for col in include_columns_inc_star if col not in exclude_columns
-        ]
+        output_columns = [col for col in include_inc_star if col not in exclude]
 
         res = {}
         for i in range(self._data.children_size()):
             n = self.dtype.fields[i].name
             if n in output_columns:
-                res[n] = ColumnFromVelox.from_velox(
+                res[n] = ColumnCpuMixin._from_velox(
                     self.device,
                     self.dtype.fields[i].dtype,
                     self._data.child_at(i),
@@ -1861,7 +2093,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
     @expression
     def groupby(
         self,
-        by: List[str],
+        by: Union[str, List[str]],
         sort=False,
         drop_null=True,
     ):
@@ -1882,13 +2114,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         Examples
         --------
         >>> import torcharrow as ta
-        >>> df = ta.DataFrame({'A': ['a', 'b', 'a', 'b'], 'B': [1, 2, 3, 4]})
+        >>> df = ta.dataframe({'A': ['a', 'b', 'a', 'b'], 'B': [1, 2, 3, 4]})
         >>> # group by A
         >>> grouped = df.groupby(['A'])
         >>> # apply sum on each of B's grouped column to create a new column
         >>> grouped_sum = grouped['B'].sum()
         >>> # combine a new dataframe from old and new columns
-        >>> res = ta.DataFrame()
+        >>> res = ta.dataframe()
         >>> res['A'] = grouped['A']
         >>> res['B.sum'] = grouped_sum
         >>> res
@@ -1911,7 +2143,7 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         dataframe, use groupby followed by select.
 
 
-        >>> df = ta.DataFrame({
+        >>> df = ta.dataframe({
         >>>    'A':['a', 'b', 'a', 'b'],
         >>>    'B': [1, 2, 3, 4],
         >>>    'C': [10,11,12,13]})
@@ -1932,9 +2164,13 @@ class DataFrameCpu(ColumnFromVelox, IDataFrame):
         ('b',)
            self._fromdata({'B':Column([2, 4], id = c131), id = c132})
         """
+        self._prototype_support_warning("groupby")
+
         # TODO implement
         assert not sort
         assert drop_null
+        if isinstance(by, str):
+            by = [by]
         self._check_columns(by)
 
         key_columns = by
@@ -1980,11 +2216,11 @@ class GroupedDataFrame:
         Return the size of each group (including nulls).
         """
         res = {
-            f.name: ta.Column([v[idx] for v, _ in self._groups.items()], f.dtype)
+            f.name: ta.column([v[idx] for v, _ in self._groups.items()], f.dtype)
             for idx, f in enumerate(self._key_fields)
         }
 
-        res["size"] = ta.Column([len(c) for _, c in self._groups.items()], dt.int64)
+        res["size"] = ta.column([len(c) for _, c in self._groups.items()], dt.int64)
 
         return self._parent._fromdata(res, None)
 
@@ -1994,7 +2230,7 @@ class GroupedDataFrame:
         """
         for g, xs in self._groups.items():
             dtype = dt.Struct(self._item_fields)
-            df = ta.Column(dtype).append(
+            df = ta.column(dtype).append(
                 tuple(
                     tuple(
                         self._parent._data.child_at(
@@ -2009,7 +2245,7 @@ class GroupedDataFrame:
             yield g, df
 
     @trace
-    def _lift(self, op: str) -> IColumn:
+    def _lift(self, op: str) -> Column:
         if len(self._key_fields) > 0:
             # it is a dataframe operation:
             return self._combine(op)
@@ -2024,15 +2260,17 @@ class GroupedDataFrame:
             res[f.name] = c
         for f, c in zip(agg_fields, self._apply(op)):
             res[f.name] = c
+        # pyre-fixme[6]: For 1st param expected `OrderedDict[str, Column]` but got
+        #  `Dict[typing.Any, typing.Any]`.
         return self._parent._fromdata(res, None)
 
-    def _apply(self, op: str) -> List[IColumn]:
+    def _apply(self, op: str) -> List[Column]:
         cols = []
         for f in self._item_fields:
             cols.append(self._apply1(f, op))
         return cols
 
-    def _apply1(self, f: dt.Field, op: str) -> IColumn:
+    def _apply1(self, f: dt.Field, op: str) -> Column:
         src_t = f.dtype
         dest_f, dest_t = dt.get_agg_op(op, src_t)
         res = Scope._EmptyColumn(dest_t)
@@ -2041,11 +2279,11 @@ class GroupedDataFrame:
         )
         for g, xs in self._groups.items():
             dest_data = [src_c[x] for x in xs]
-            dest_c = dest_f(ta.Column(dest_data, dtype=dest_t))
+            dest_c = dest_f(ta.column(dest_data, dtype=dest_t))
             res._append(dest_c)
         return res._finalize()
 
-    def _unzip_group_keys(self) -> List[IColumn]:
+    def _unzip_group_keys(self) -> List[Column]:
         cols = []
         for f in self._key_fields:
             cols.append(Scope._EmptyColumn(f.dtype))
@@ -2109,12 +2347,6 @@ class GroupedDataFrame:
         # skipna == True
         return self._lift("sum")
 
-    def prod(self):
-        """Return produce of the values in the data"""
-        # skipna == True
-        # only_numerical == True
-        return self._lift("prod")
-
     def mean(self):
         """Return the mean of the values in the series."""
         return self._lift("mean")
@@ -2132,7 +2364,7 @@ class GroupedDataFrame:
         return self._lift("std")
 
     def count(self):
-        """Return the stddev(s) of the data."""
+        """Return the count(s) of the data."""
         return self._lift("count")
 
     # TODO should add reduce here as well...
@@ -2208,7 +2440,12 @@ class GroupedDataFrame:
 
 Dispatcher.register((dt.Struct.typecode + "_empty", "cpu"), DataFrameCpu._empty)
 Dispatcher.register((dt.Struct.typecode + "_full", "cpu"), DataFrameCpu._full)
-Dispatcher.register((dt.Struct.typecode + "_fromlist", "cpu"), DataFrameCpu._fromlist)
+Dispatcher.register(
+    (dt.Struct.typecode + "_from_pysequence", "cpu"), DataFrameCpu._from_pysequence
+)
+Dispatcher.register(
+    (dt.Struct.typecode + "_from_arrow", "cpu"), DataFrameCpu._from_arrow
+)
 
 
 # ------------------------------------------------------------------------------

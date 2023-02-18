@@ -1,4 +1,11 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -7,14 +14,16 @@
 #include <unordered_map>
 #include "vector.h"
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/core/QueryCtx.h"
-#include "velox/common/base/Exceptions.h"
 #include "velox/expression/Expr.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/arrow/Abi.h"
+#include "velox/vector/arrow/Bridge.h"
 
 // TODO: Move uses of static variables into .cpp. Static variables are local to
 // the compilation units so every file that includes this header will have its
@@ -56,23 +65,37 @@ inline bool operator==(
 }
 
 velox::variant pyToVariant(const pybind11::handle& obj);
+velox::variant pyToVariantTyped(
+    const pybind11::handle& obj,
+    const std::shared_ptr<const velox::Type>& type);
 
 class BaseColumn;
 
-struct OperatorHandle {
-  velox::RowTypePtr inputRowType_;
-  std::shared_ptr<velox::exec::ExprSet> exprSet_;
-
+class OperatorHandle {
+ public:
   OperatorHandle(
       velox::RowTypePtr inputRowType,
       std::shared_ptr<velox::exec::ExprSet> exprSet)
       : inputRowType_(inputRowType), exprSet_(exprSet) {}
 
+  // Create OperatorHandle based on the function name, input type
+  // and explicitly provided output type.
+  static std::unique_ptr<OperatorHandle> fromCall(
+      velox::RowTypePtr inputRowType,
+      velox::TypePtr outputType,
+      const std::string& functionName);
+
   // Create OperatorHandle based on the function name and input type
   // Doesn't handle type promotion yet
-  static std::unique_ptr<OperatorHandle> fromGenericUDF(
+  static std::unique_ptr<OperatorHandle> fromUDF(
       velox::RowTypePtr inputRowType,
       const std::string& udfName);
+
+  // Create OperatorHandle based on input type and output type only.
+  // Note that this creates a cast expression, not a call expression.
+  static std::unique_ptr<OperatorHandle> fromCast(
+      velox::RowTypePtr inputRowType,
+      velox::TypePtr outputType);
 
   static velox::RowVectorPtr wrapRowVector(
       const std::vector<velox::VectorPtr>& children,
@@ -85,15 +108,25 @@ struct OperatorHandle {
         children);
   }
 
-  std::unique_ptr<BaseColumn> call(velox::vector_size_t size);
-
   // Specialized invoke methods for common arities
   // Input type velox::VectorPtr (instead of BaseColumn) since it might be a
   // ConstantVector
   // TODO: Use Column once ConstantColumn is supported
+  std::unique_ptr<BaseColumn> call(
+      velox::RowVectorPtr inputRows,
+      velox::vector_size_t size);
+
+  std::unique_ptr<BaseColumn> call(velox::vector_size_t size);
+
+  std::unique_ptr<BaseColumn> call(velox::VectorPtr a);
+
   std::unique_ptr<BaseColumn> call(velox::VectorPtr a, velox::VectorPtr b);
 
   std::unique_ptr<BaseColumn> call(const std::vector<velox::VectorPtr>& args);
+
+ private:
+  velox::RowTypePtr inputRowType_;
+  std::shared_ptr<velox::exec::ExprSet> exprSet_;
 };
 
 class PromoteNumericTypeKind {
@@ -186,7 +219,10 @@ enum class BinaryOpCode : int16_t {
   Plus = 0,
   Minus,
   Multiply,
+  Divide,
+  Floordiv,
   Modulus,
+  Pow,
   Eq,
   Neq,
   Lt,
@@ -213,7 +249,7 @@ class BaseColumn {
   friend class ArrayColumn;
   friend class MapColumn;
   friend class RowColumn;
-  friend struct OperatorHandle;
+  friend class OperatorHandle;
 
  protected:
   velox::VectorPtr _delegate;
@@ -257,14 +293,9 @@ class BaseColumn {
       velox::VectorPtr veloxVector,
       velox::vector_size_t offset,
       velox::vector_size_t length) {
-    velox::vector_size_t nullCount = 0;
-    VELOX_CHECK(offset + length <= veloxVector->size());
-    for (velox::vector_size_t i = 0; i < length; i++) {
-      if (veloxVector->isNullAt(offset + i)) {
-        nullCount++;
-      }
-    }
-    return nullCount;
+    VELOX_CHECK_LE(offset + length, veloxVector->size());
+    return velox::BaseVector::countNulls(
+        veloxVector->nulls(), offset, offset + length);
   }
 
  public:
@@ -272,12 +303,13 @@ class BaseColumn {
       const BaseColumn& other,
       velox::vector_size_t offset,
       velox::vector_size_t length)
-      : _delegate(other._delegate),
-        _offset(offset),
-        _length(length),
-        // Always re-count nulls. This is a "slice" constructor so the null
-        // count should be the number of nulls within the slice
-        _nullCount(countNulls(_delegate, _offset, _length)) {}
+      : _delegate(other._delegate), _offset(offset), _length(length) {
+    if (!_delegate->getNullCount().has_value() ||
+        *_delegate->getNullCount() == 0) {
+      _delegate->setNullCount(countNulls(_delegate, 0, _delegate->size()));
+    }
+    _nullCount = countNulls(_delegate, _offset, _length);
+  }
 
   explicit BaseColumn(velox::TypePtr type)
       : _offset(0), _length(0), _nullCount(0) {
@@ -285,11 +317,13 @@ class BaseColumn {
   }
 
   explicit BaseColumn(velox::VectorPtr delegate)
-      : _delegate(delegate),
-        _offset(0),
-        _length(delegate->size()),
-        _nullCount(delegate->getNullCount().value_or(
-            countNulls(delegate, _offset, _length))) {}
+      : _delegate(delegate), _offset(0), _length(delegate->size()) {
+    if (!_delegate->getNullCount().has_value() ||
+        *_delegate->getNullCount() == 0) {
+      _delegate->setNullCount(countNulls(_delegate, 0, _delegate->size()));
+    }
+    _nullCount = *_delegate->getNullCount();
+  }
 
   virtual ~BaseColumn() = default;
 
@@ -317,19 +351,7 @@ class BaseColumn {
     return _delegate;
   }
 
-  // TODO: deprecate this method and migrate to OperatorHandle::fromGenericUDF
-  static std::shared_ptr<velox::exec::ExprSet> genUnaryExprSet(
-      // input row type is required even for unary op since the input vector
-      // needs to be wrapped into a velox::RowVector before evaluation.
-      std::shared_ptr<const velox::RowType> inputRowType,
-      velox::TypePtr outputType,
-      const std::string& functionName);
-
-  std::unique_ptr<BaseColumn> applyUnaryExprSet(
-      // input row type is required even for unary op since the input vector
-      // needs to be wrapped into a velox::RowVector before evaluation.
-      std::shared_ptr<const velox::RowType> inputRowType,
-      std::shared_ptr<velox::exec::ExprSet> exprSet);
+  void exportToArrow(ArrowArray* output);
 
   static std::shared_ptr<velox::exec::ExprSet> genBinaryExprSet(
       std::shared_ptr<const velox::RowType> inputRowType,
@@ -346,20 +368,9 @@ class BaseColumn {
 
  public:
   // generic UDF
-  static std::unique_ptr<BaseColumn> genericUnaryUDF(
+  static std::unique_ptr<BaseColumn> genericUDF(
       const std::string& udfName,
-      const BaseColumn& col1);
-
-  static std::unique_ptr<BaseColumn> genericBinaryUDF(
-      const std::string& udfName,
-      const BaseColumn& col1,
-      const BaseColumn& col2);
-
-  static std::unique_ptr<BaseColumn> genericTrinaryUDF(
-      const std::string& udfName,
-      const BaseColumn& col1,
-      const BaseColumn& col2,
-      const BaseColumn& col3);
+      const std::vector<BaseColumn>& cols);
 
   // factory UDF (e.g rand)
   static std::unique_ptr<BaseColumn> factoryNullaryUDF(
@@ -414,6 +425,7 @@ class SimpleColumn : public BaseColumn {
     _delegate->resize(index + 1);
     _delegate->setNull(index, true);
     _nullCount++;
+    _delegate->setNullCount(_nullCount);
     bumpLength();
   }
 
@@ -431,56 +443,85 @@ class SimpleColumn : public BaseColumn {
   std::unique_ptr<BaseColumn> invert() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = []() -> std::shared_ptr<velox::exec::ExprSet> {
+    const static auto opHandle = []() -> std::unique_ptr<OperatorHandle> {
       if constexpr (std::is_same_v<T, bool>) {
-        return BaseColumn::genUnaryExprSet(
+        return OperatorHandle::fromCall(
             inputRowType, velox::CppToType<T>::create(), "not");
       } else {
-        return BaseColumn::genUnaryExprSet(
+        return OperatorHandle::fromCall(
             inputRowType, velox::CppToType<T>::create(), "bitwise_not");
       }
     }();
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+
+    return opHandle->call(_delegate);
   }
 
   std::unique_ptr<BaseColumn> neg() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = BaseColumn::genUnaryExprSet(
+    const static auto opHandle = OperatorHandle::fromCall(
         inputRowType, velox::CppToType<T>::create(), "negate");
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+    return opHandle->call(_delegate);
   }
 
   std::unique_ptr<BaseColumn> abs() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = BaseColumn::genUnaryExprSet(
+    const static auto opHandle = OperatorHandle::fromCall(
         inputRowType, velox::CppToType<T>::create(), "abs");
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+    return opHandle->call(_delegate);
   }
 
   std::unique_ptr<BaseColumn> ceil() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = BaseColumn::genUnaryExprSet(
+    const static auto opHandle = OperatorHandle::fromCall(
         inputRowType, velox::CppToType<T>::create(), "ceil");
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+    return opHandle->call(_delegate);
   }
 
   std::unique_ptr<BaseColumn> floor() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = BaseColumn::genUnaryExprSet(
+    const static auto opHandle = OperatorHandle::fromCall(
         inputRowType, velox::CppToType<T>::create(), "floor");
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+    return opHandle->call(_delegate);
   }
 
   std::unique_ptr<BaseColumn> round() {
     const static auto inputRowType =
         velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto exprSet = BaseColumn::genUnaryExprSet(
-        inputRowType, velox::CppToType<T>::create(), "round");
-    return this->applyUnaryExprSet(inputRowType, exprSet);
+    const static auto opHandle = OperatorHandle::fromCall(
+        inputRowType, velox::CppToType<T>::create(), "torcharrow_round");
+    return opHandle->call(_delegate);
+  }
+
+  //
+  // unary cast
+  //
+  // Note that we accept the casted-to return type as a value parameter, and
+  // we populate a static array of OperatorHandles, one for each casted-to
+  // type we see. We accept the return type as a value at runtime instead of
+  // as a template parameter at compile-time to avoid creating N^2 number of
+  // cast functions.
+  //
+  std::unique_ptr<BaseColumn> cast(velox::TypeKind toKind) {
+    constexpr auto num_numeric_types =
+        static_cast<int>(velox::TypeKind::DOUBLE) + 1;
+    static std::array<
+        std::unique_ptr<OperatorHandle>,
+        num_numeric_types> /* library-local */ opHandles;
+
+    int id = static_cast<int>(toKind);
+    if (opHandles[id] == nullptr) {
+      const static auto inputRowType =
+          velox::ROW({"c0"}, {velox::CppToType<T>::create()});
+      velox::TypePtr toType =
+          VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(kind2type, toKind);
+      opHandles[id] = OperatorHandle::fromCast(inputRowType, toType);
+    }
+
+    return opHandles[id]->call(_delegate);
   }
 
   //
@@ -540,83 +581,6 @@ class SimpleColumn : public BaseColumn {
 
     return dispatchBinaryOperation(other, commonTypeKind, opCode, opType);
   }
-
-  //
-  // string column ops
-  // TODO: remove these method binding and migrate to the
-  // genericUnaryUDF methods
-  //
-  std::unique_ptr<BaseColumn> lower() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "lower should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op =
-        OperatorHandle::fromGenericUDF(inputRowType, "lower");
-    return op->call({_delegate});
-  }
-
-  std::unique_ptr<BaseColumn> upper() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "upper should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op =
-        OperatorHandle::fromGenericUDF(inputRowType, "upper");
-    return op->call({_delegate});
-  }
-
-  std::unique_ptr<BaseColumn> isalpha() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "isalpha should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op =
-        OperatorHandle::fromGenericUDF(inputRowType, "torcharrow_isalpha");
-    return op->call({_delegate});
-  }
-
-  std::unique_ptr<BaseColumn> isalnum() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "isalnum should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op =
-        OperatorHandle::fromGenericUDF(inputRowType, "torcharrow_isalnum");
-    return op->call({_delegate});
-  }
-
-  std::unique_ptr<BaseColumn> isinteger() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "isinteger should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op = OperatorHandle::fromGenericUDF(
-        inputRowType, "torcharrow_isinteger");
-    return op->call({_delegate});
-  }
-
-  std::unique_ptr<BaseColumn> islower() {
-    static_assert(
-        std::is_same<velox::StringView, T>(),
-        "islower should only be called over VARCHAR column");
-
-    const static auto inputRowType =
-        velox::ROW({"c0"}, {velox::CppToType<T>::create()});
-    const static auto op =
-        OperatorHandle::fromGenericUDF(inputRowType, "torcharrow_islower");
-    return op->call({_delegate});
-  }
 };
 
 template <typename T>
@@ -625,11 +589,17 @@ class FlatColumn : public SimpleColumn<T> {};
 template <typename T>
 class ConstantColumn : public SimpleColumn<T> {
  public:
+  // For scalar type that ConstantVector can be created from variant
   ConstantColumn(velox::variant value, velox::vector_size_t size)
       : SimpleColumn<T>(velox::BaseVector::createConstant(
             value,
             size,
             TorchArrowGlobalStatic::rootMemoryPool())) {}
+
+  // Create from a Vector position
+  ConstantColumn(velox::VectorPtr vector, int index, velox::vector_size_t size)
+      : SimpleColumn<T>(
+            velox::BaseVector::wrapInConstant(size, index, vector)) {}
 };
 
 class ArrayColumn : public BaseColumn {
@@ -669,6 +639,8 @@ class ArrayColumn : public BaseColumn {
     auto new_size = 0;
     dataPtr->setOffsetAndSize(new_index, new_offset, new_size);
     dataPtr->setNull(new_index, true);
+    _nullCount++;
+    _delegate->setNullCount(_nullCount);
     bumpLength();
   }
 
@@ -681,6 +653,8 @@ class ArrayColumn : public BaseColumn {
       velox::vector_size_t length) {
     return std::make_unique<ArrayColumn>(*this, offset, length);
   }
+
+  std::unique_ptr<ArrayColumn> withElements(const BaseColumn& newElements);
 };
 
 class MapColumn : public BaseColumn {
@@ -733,6 +707,8 @@ class MapColumn : public BaseColumn {
     auto new_size = 0;
     dataPtr->setOffsetAndSize(new_index, new_offset, new_size);
     dataPtr->setNull(new_index, true);
+    _nullCount++;
+    _delegate->setNullCount(_nullCount);
     bumpLength();
   }
 
@@ -777,12 +753,12 @@ class RowColumn : public BaseColumn {
       velox::vector_size_t length)
       : BaseColumn(other, offset, length) {}
 
-  std::unique_ptr<BaseColumn> childAt(velox::ChannelIndex index) {
+  std::unique_ptr<BaseColumn> childAt(velox::column_index_t index) {
     auto dataPtr = _delegate.get()->as<velox::RowVector>();
     return createColumn(dataPtr->childAt(index), _offset, _length);
   }
 
-  void setChild(velox::ChannelIndex index, const BaseColumn& new_child) {
+  void setChild(velox::column_index_t index, const BaseColumn& new_child) {
     auto dataPtr = _delegate.get()->as<velox::RowVector>();
     dataPtr->children()[index] = new_child._delegate;
   }

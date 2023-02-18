@@ -1,4 +1,9 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import json
 import typing as ty
 import warnings
@@ -6,7 +11,7 @@ import warnings
 import torcharrow as ta
 import torcharrow.dtypes as dt
 
-from .dispatcher import Dispatcher, Device
+from .dispatcher import Device, Dispatcher
 from .trace import Trace, trace
 
 # ---------------------------------------------------------------------------
@@ -31,7 +36,12 @@ class Counter:
 
 # Scope will be deprecated in the future.
 # Please DON'T use it in user-level code.
+# pyre-fixme[13]: Attribute `default` is never initialized.
 class Scope:
+    """
+    This class will be deprecated in the future.
+    Please don't use it in user code.
+    """
 
     default: ty.ClassVar["Scope"]
 
@@ -87,10 +97,10 @@ class Scope:
     # TODO: refactor these static methods out of scope.py
     @staticmethod
     def _require_column_constructors_to_be_registered():
-        from .idataframe import DataFrame
-        from .ilist_column import IListColumn
-        from .imap_column import IMapColumn
-        from .istring_column import IStringColumn
+        from .idataframe import dataframe
+        from .ilist_column import ListColumn
+        from .imap_column import MapColumn
+        from .istring_column import StringColumn
         from .velox_rt import NumericalColumnCpu
 
     # private column/dataframe constructors -----------------------------------
@@ -125,17 +135,25 @@ class Scope:
         return call(device, data, dtype, mask)
 
     @staticmethod
-    def _FromPyList(data: ty.List, dtype: dt.DType, device=""):
+    def _FromPySequence(data: ty.Sequence, dtype: dt.DType, device=""):
         """
-        Convert from plain Python container (list of scalars or containers).
+        Convert from plain Python sequence (sequence of scalars or containers).
         """
         Scope._require_column_constructors_to_be_registered()
 
         device = device or Scope.default.device
-        # TODO: rename the dispatch key to be "_from_pylist"
-        call = Dispatcher.lookup((dtype.typecode + "_fromlist", device))
+        call = Dispatcher.lookup((dtype.typecode + "_from_pysequence", device))
 
         return call(device, data, dtype)
+
+    @staticmethod
+    def null_check_from_pysequence(data: ty.Sequence, dtype: dt.DType, device=""):
+        result = Scope._FromPySequence(data, dtype, device)
+
+        # since dtype is known, check the nullability
+        if not dtype.nullable and result.null_count != 0:
+            raise ValueError(f"None found in the list for non-nullable type: {dtype}")
+        return result
 
     @staticmethod
     @trace
@@ -161,15 +179,18 @@ class Scope:
         if isinstance(data, dt.DType):
             (data, dtype) = (dtype, data)
 
-        # data is Python list
-        if isinstance(data, ty.List):
+        # data is a list or a tuple; we only allow type inference from flat tuples
+        # pyre-fixme[6]: For 2nd param expected `Union[Type[typing.Any],
+        #  typing.Tuple[Type[typing.Any], ...]]` but got `_SpecialForm`.
+        if isinstance(data, ty.List) or isinstance(data, ty.Tuple):
             # TODO: infer the type from the whole list
             dtype = dtype or dt.infer_dtype_from_prefix(data[:7])
             if dtype is None or dt.is_any(dtype):
                 raise ValueError("Column cannot infer type from data")
             if dt.contains_tuple(dtype):
-                raise TypeError("Cannot infer type from Python tuple")
-            return Scope._FromPyList(data, dtype, device)
+                raise TypeError("Cannot infer type from nested Python tuple")
+
+            return Scope.null_check_from_pysequence(data, dtype, device)
 
         if Scope._is_column(data):
             dtype = dtype or data.dtype
@@ -177,11 +198,11 @@ class Scope:
                 return data
             else:
                 # TODO: More efficient interop, such as leveraging arrow
-                return ta.from_pylist(data.to_pylist(), dtype=dtype, device=device)
+                return ta.from_pysequence(data.to_pylist(), dtype=dtype, device=device)
 
         if data is not None:
             warnings.warn(
-                "Constructing column from non Python list/IColumn may result in degenerated performance"
+                "Constructing column from non Python list/Column may result in degenerated performance"
             )
 
         # dtype given, optional data
@@ -194,9 +215,10 @@ class Scope:
 
         # data given, optional column
         if data is not None:
-            if isinstance(data, ty.Sequence):
-                data = iter(data)
             if isinstance(data, ty.Iterable):
+                # make sure that we are dealing with an actual Iterator
+                data = iter(data)
+
                 prefix = []
                 for i, v in enumerate(data):
                     prefix.append(v)
@@ -215,13 +237,13 @@ class Scope:
                 # add prefix and ...
                 for p in prefix:
                     col._append(p)
-                # ... continue enumerate the data
-                for _, v in enumerate(data):
-                    col._append(v)
+                # ... continue to add the rest of the data
+                for i in data:
+                    col._append(i)
                 return col._finalize()
             else:
                 raise TypeError(
-                    f"data parameter of ty.Sequence type expected (got {type(dtype).__name__})"
+                    f"data parameter of ty.Iterable type expected (got {type(dtype).__name__})"
                 )
         else:
             raise AssertionError("unexpected case")
@@ -278,10 +300,7 @@ class Scope:
                 return Scope._EmptyColumn(dtype, device=device)._finalize()
             else:
                 if isinstance(data, ty.Sequence):
-                    res = Scope._EmptyColumn(dtype, device=device)
-                    for i in data:
-                        res._append(i)
-                    return res._finalize()
+                    return Scope._Column(data, dtype, device)
                 elif isinstance(data, ty.Mapping):
                     res = {}
                     dtype_fields = {f.name: f.dtype for f in dtype.fields}
@@ -325,20 +344,26 @@ but data only provides {len(data)} fields: {data.keys()}
                 if dtype is None or not dt.is_tuple(dtype):
                     raise TypeError("Dataframe cannot infer struct type from data")
                 dtype = ty.cast(dt.Tuple, dtype)
-                if columns is None:
-                    raise TypeError(
-                        "DataFrame construction from tuples requires"
-                        " dtype or columns to be given"
-                    )
-                if len(dtype.fields) != len(columns):
-                    raise TypeError("Dataframe column length must equal row length")
+                if columns is not None:
+                    if len(dtype.fields) != len(columns):
+                        raise TypeError("Dataframe column length must equal row length")
+                else:
+                    first_tuple_columns = None
+                    for v in data:
+                        if v is not None:
+                            if hasattr(v, "_fields"):
+                                first_tuple_columns = v._fields
+                                break
+                    if first_tuple_columns is None:
+                        raise TypeError(
+                            "DataFrame construction from tuples requires dtype or columns to be given"
+                        )
+                    columns = list(first_tuple_columns)
                 dtype = dt.Struct(
                     [dt.Field(n, t) for n, t in zip(columns, dtype.fields)]
                 )
-                res = Scope._EmptyColumn(dtype, device=device)
-                for i in data:
-                    res._append(i)
-                return res._finalize()
+
+                return Scope._Column(data, dtype, device)
             elif isinstance(data, ty.Mapping):
                 res = {}
                 for n, c in data.items():
@@ -365,7 +390,7 @@ but data only provides {len(data)} fields: {data.keys()}
     # helper ------------------------------------------------------------------
     @staticmethod
     def _is_column(c):
-        # NOTE: should be isinstance(c, IColumn)
+        # NOTE: should be isinstance(c, Column)
         # But can't do tha due to cyclic reference, so we use ...
         return c is not None and hasattr(c, "_dtype") and hasattr(c, "_device")
 

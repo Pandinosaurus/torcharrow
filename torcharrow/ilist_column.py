@@ -1,40 +1,48 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import abc
 import array as ar
 import builtins
 import functools
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torcharrow.dtypes as dt
 
-from .icolumn import IColumn
+from .icolumn import Column
 
 # -----------------------------------------------------------------------------
-# IListColumn
+# ListColumn
 
 
-class IListColumn(IColumn):
+class ListColumn(Column):
 
     # private constructor
     def __init__(self, device, dtype):
         assert dt.is_list(dtype)
         super().__init__(device, dtype)
-        self.list = IListMethods(self)
+        self.list = ListMethods(self)
 
 
 # -----------------------------------------------------------------------------
-# IListMethods
+# ListMethods
 
 
-class IListMethods(abc.ABC):
-    """Vectorized list functions for IListColumn"""
+class ListMethods(abc.ABC):
+    """Vectorized list functions for ListColumn"""
 
     def __init__(self, parent):
-        self._parent: IListColumn = parent
+        self._parent: ListColumn = parent
 
     def length(self):
+        """
+        Compute the length of each element in the Column.
+        """
         me = self._parent
         return me._vectorize(len, dt.Int64(me.dtype.nullable))
 
@@ -53,12 +61,14 @@ class IListMethods(abc.ABC):
 
         Examples
         >>> import torcharrow as ta
-        >>> s = ta.Column(['what a wonderful world!', 'really?'])
+        >>> s = ta.column(['what a wonderful world!', 'really?'])
         >>> s.str.split(sep=' ').list.join(sep='-')
         0  'what-a-wonderful-world!'
         1  'really?'
         dtype: string, length: 2, null_count: 0
         """
+        self._parent._prototype_support_warning("list.join")
+
         me = self._parent
         assert dt.is_string(me.dtype.item_dtype)
 
@@ -70,6 +80,8 @@ class IListMethods(abc.ABC):
         )
 
     def get(self, i):
+        self._parent._prototype_support_warning("list.get")
+
         me = self._parent
 
         def fun(xs):
@@ -77,25 +89,57 @@ class IListMethods(abc.ABC):
 
         return me._vectorize(fun, me.dtype.item_dtype.with_null(me.dtype.nullable))
 
-    def slice(
-        self, start: int = None, stop: int = None, step: int = None
-    ) -> IListColumn:
-        """Slice sublist from each element in the column"""
-        me = self._parent
+    def slice(self, start: int = 0, stop: Optional[int] = None) -> ListColumn:
+        """
+        Slice sublist from each element in the column
 
-        def fun(i):
-            return i[start:stop:step]
+        Parameters
+        ----------
+        start - int, default 0
+            Start position for slice operation. Negative starting position is not supported yet.
+        start - int, optional
+            Stop position for slice operation. Negative stop position is not supported yet.
+        """
+        raise NotImplementedError
 
-        return me._vectorize(fun, me.dtype)
+    def vmap(self, fun: Callable[[Column], Column]):
+        """
+        (EXPERIMENTAL API) Vectorizing map. Expects a callable that working on a batch (represents by a Column).
 
-    def count(self, elem, flags=0):
-        me = self._parent
+        Examples
+        --------
+        >>> import torcharrow as ta
+        >>> a = ta.column([[1, 2, None, 3], [4, None, 5]])
 
-        def fun(i):
-            return i.count(elem)
+        >>> a
+        0  [1, 2, None, 3]
+        1  [4, None, 5]
+        dtype: List(Int64(nullable=True)), length: 2, null_count: 0
 
-        return me._vectorize(fun, dt.Int64(me.dtype.nullable))
+        >>> a.list.vmap(lambda col: col + 1)
+        0  [2, 3, None, 4]
+        1  [5, None, 6]
+        dtype: List(Int64(nullable=True), nullable=True), length: 2, null_count: 0
 
+        >>> import torcharrow.dtypes as dt
+        >>> b = ta.column([[(1, "a"), (2, "b")], [(3, "c")]],
+            dtype=dt.List(
+                dt.Struct([dt.Field("f1", dt.int64), dt.Field("f2", dt.string)])
+            ))
+
+        >>> b
+        0  [(1, 'a'), (2, 'b')]
+        1  [(3, 'c')]
+        dtype: List(Struct([Field('f1', int64), Field('f2', string)])), length: 2, null_count: 0
+
+        >>> b.list.vmap(lambda df: df["f2"])
+        0  ['a', 'b']
+        1  ['c']
+        dtype: List(String(nullable=True), nullable=True), length: 2, null_count: 0
+        """
+        raise NotImplementedError()
+
+    # functional tools
     def map(self, fun, dtype: Optional[dt.DType] = None):
         me = self._parent
 
@@ -121,6 +165,7 @@ class IListMethods(abc.ABC):
         def func(xs):
             return functools.reduce(fun, xs, initializer)
 
+        # pyre-fixme[16]: `DType` has no attribute `item_dtype`.
         dtype = me.dtype.item_dtype if dtype is None else dtype
         return me._vectorize(func, dtype)
 

@@ -1,17 +1,9 @@
 #!/bin/bash
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 ###############################################################################
 # Copied from https://github.com/facebookincubator/velox/blob/78159a995038e38576c354348023f50cc49a4864/scripts/setup-macos.sh
@@ -32,9 +24,12 @@
 set -e # Exit on error.
 set -x # Print commands that are executed.
 
-FB_OS_VERSION=v2021.05.10.00
+SCRIPTDIR=$(dirname "${BASH_SOURCE[0]}")
+source $SCRIPTDIR/../csrc/velox/velox/scripts/setup-helper-functions.sh
+
+FB_OS_VERSION=v2022.03.14.00
 NPROC=$(sysctl -n hw.physicalcpu)
-COMPILER_FLAGS="-mavx2 -mfma -mavx -mf16c -masm=intel -mlzcnt"
+COMPILER_FLAGS=$(get_cxx_flags $CPU_TARGET)
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
 MACOS_DEPS="ninja cmake ccache protobuf icu4c boost gflags glog libevent lz4 lzo snappy xz zstd"
 
@@ -111,13 +106,8 @@ function install_build_prerequisites {
   pip3 install --user cmake-format regex
 }
 
-function install_googletest {
-  github_checkout google/googletest release-1.10.0
-  cmake_install
-}
-
 function install_fmt {
-  github_checkout fmtlib/fmt 7.1.3
+  github_checkout fmtlib/fmt 8.0.0
   cmake_install -DFMT_TEST=OFF
 }
 
@@ -139,13 +129,13 @@ function install_folly {
 }
 
 function install_ranges_v3 {
-  github_checkout ericniebler/range-v3 master
-  cmake_install -DRANGES_ENABLE_WERROR=OFF
+  github_checkout ericniebler/range-v3 0.12.0
+  cmake_install -DRANGES_ENABLE_WERROR=OFF -DRANGE_V3_TESTS=OFF -DRANGE_V3_EXAMPLES=OFF
 }
 
 function install_re2 {
   github_checkout google/re2 2021-04-01
-  cmake_install
+  cmake_install -DRE2_BUILD_TESTING=OFF
 }
 
 function install_velox_deps {
@@ -153,7 +143,6 @@ function install_velox_deps {
     run_and_time install_build_prerequisites
   fi
   run_and_time install_ranges_v3
-  run_and_time install_googletest
   run_and_time install_fmt
   run_and_time install_double_conversion
   run_and_time install_folly

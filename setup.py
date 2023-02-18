@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import distutils.command.clean
 import os
 import platform
@@ -7,15 +12,14 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from setuptools import Extension
-from setuptools import find_packages, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = Path(__file__).parent.resolve()
 
 
 def _get_version():
-    version = "0.1.0a0"
+    version = open("./version.txt").read().strip()
     sha = "Unknown"
     try:
         sha = (
@@ -89,16 +93,24 @@ class CMakeBuild(build_ext):
         else:
             cfg = "Debug" if self.debug else "Release"
 
+        if "USE_TORCH" in os.environ:
+            import torch
+
+            CMAKE_PREFIX_PATH = f"-DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}"
+            USE_TORCH = "-DUSE_TORCH=ON"
+            TORCH_FLAGS = [CMAKE_PREFIX_PATH, USE_TORCH]
+        else:
+            USE_TORCH = "-DUSE_TORCH=OFF"
+            TORCH_FLAGS = [USE_TORCH]
+
         cmake_args = [
             f"-DCMAKE_BUILD_TYPE={cfg}",
-            # f"-DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}",
             f"-DCMAKE_INSTALL_PREFIX={extdir}",
-            # "-DCMAKE_VERBOSE_MAKEFILE=ON",
+            "-DCMAKE_VERBOSE_MAKEFILE=ON",
             # f"-DPython_INCLUDE_DIR={distutils.sysconfig.get_python_inc()}",
-            "-DVELOX_BUILD_TESTING=OFF",
-            "-DVELOX_ENABLE_DUCKDB=OFF",
-            "-DCODEGEN_SUPPORT=OFF",
-        ]
+            "-DVELOX_CODEGEN_SUPPORT=OFF",
+            "-DVELOX_BUILD_MINIMAL=ON",
+        ] + TORCH_FLAGS
         build_args = ["--target", "install"]
 
         # Default to Ninja
@@ -135,20 +147,22 @@ setup(
     license="BSD",
     install_requires=[
         "arrow",
-        "numpy",
-        "pandas",
+        "cffi",
+        "numpy==1.21.4",
+        "pandas<=1.3.5",  # Last version that has Python 3.7 wheel
         "typing",
         "tabulate",
         "typing-inspect",
         "pyarrow",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.7",
     classifiers=[
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: BSD License",
         "Operating System :: POSIX :: Linux",
         "Programming Language :: C++",
+        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: Implementation :: CPython",

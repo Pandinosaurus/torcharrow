@@ -1,58 +1,66 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import abc
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-# TODO: use re2
-import re
+from abc import ABC, abstractmethod
+from typing import Optional
 
-import numpy.ma as ma
 import torcharrow.dtypes as dt
 
-from .expression import expression
-from .icolumn import IColumn
+from .icolumn import Column
 
 # ------------------------------------------------------------------------------
-# IStringColumn
+# StringColumn
 
 
-class IStringColumn(IColumn):
+class StringColumn(Column):
 
     # private constructor
     def __init__(self, device, dtype):  # REP offsets
         assert dt.is_string(dtype)
         super().__init__(device, dtype)
         # must be set by subclass
-        self.str: IStringMethods = None
+        self.str: StringMethods = None
 
 
 # ------------------------------------------------------------------------------
-# IStringMethods
+# StringMethods
 
 
-class IStringMethods(abc.ABC):
-    """Vectorized string functions for IStringColumn"""
+class StringMethods(ABC):
+    """Vectorized string functions for StringColumn"""
 
     def __init__(self, parent):
-        self._parent: IStringColumn = parent
+        self._parent: StringColumn = parent
 
+    @abstractmethod
     def length(self):
-        return self._vectorize_int64(len)
+        """
+        Compute the length of each element in the Column.
+        """
+        raise NotImplementedError
 
-    def slice(self, start: int = None, stop: int = None) -> IStringColumn:
+    @abstractmethod
+    def slice(
+        self, start: Optional[int] = None, stop: Optional[int] = None
+    ) -> StringColumn:
         """Slice substrings from each element in the Column."""
+        raise NotImplementedError
 
-        def func(i):
-            return i[start:stop]
-
-        return self._vectorize_string(func)
-
-    def split(self, sep=None):
+    @abstractmethod
+    def split(self, pat=None, n=-1):
         """
         Split strings around given separator/delimiter.
 
         Parameters
         ----------
-        sep - str, default None
-            String literal to split on.  When None split according to whitespace.
+        pat - str, default None
+            String literal to split on, does not yet support regular expressions.
+            When None split according to whitespace.
+        n - int, default -1 means no limit
+            Maximum number of splits to do. 0 will be interpreted as return all splits.
 
         See Also
         --------
@@ -61,20 +69,20 @@ class IStringMethods(abc.ABC):
         Examples
         --------
         >>> import torcharrow as ta
-        >>> s = ta.Column(['what a wonderful world!', 'really?'])
-        >>> s.str.split(sep=' ')
+        >>> s = ta.column(['what a wonderful world!', 'really?'])
+        >>> s.str.split(pat=' ')
         0  ['what', 'a', 'wonderful', 'world!']
+        1  ['really?']
+        dtype: List(string), length: 2, null_count: 0
+        >>> s.str.split(pat=' ', n=2)
+        0  ['what', 'a', 'wonderful world!']
         1  ['really?']
         dtype: List(string), length: 2, null_count: 0
 
         """
-        me = self._parent
+        raise NotImplementedError
 
-        def fun(i):
-            return i.split(sep)
-
-        return self._vectorize_list_string(fun)
-
+    @abstractmethod
     def strip(self):
         """
         Remove leading and trailing whitespaces.
@@ -82,149 +90,150 @@ class IStringMethods(abc.ABC):
         Strip whitespaces (including newlines) from each string in the Column
         from left and right sides.
         """
-        return self._vectorize_string(lambda s: s.strip())
+        raise NotImplementedError
 
     # Check whether all characters in each string are  -----------------------------------------------------
     # alphabetic/numeric/digits/decimal...
 
+    @abstractmethod
     def isalpha(self):
-        return self._vectorize_boolean(str.isalpha)
+        """
+        Return True if the string is an alphabetic string, False otherwise.
 
+        A string is alphabetic if all characters in the string are alphabetic
+        and there is at least one character in the string.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def isnumeric(self):
-        return self._vectorize_boolean(str.isnumeric)
+        """
+        Returns True if all the characters are numeric, otherwise False.
 
+        A string is a numeric if each character of the string is numeric.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def isalnum(self):
-        return self._vectorize_boolean(str.isalnum)
+        """
+        Return True if all characters in the string are alphanumeric (either
+        alphabets or numbers), False otherwise.
+        """
+        raise NotImplementedError
 
+    @abstractmethod
     def isdigit(self):
-        return self._vectorize_boolean(str.isdigit)
+        """
+        Return True if all characters in the string are numeric, False otherwise.
+        """
+        raise NotImplementedError
 
+    @abstractmethod
     def isdecimal(self):
-        return self._vectorize_boolean(str.isdecimal)
+        """
+        Return True if the string contains only decimal digit (from 0 to 9), False
+        otherwise.
 
+        A string is decimal if all characters in the string are decimal digits
+        and there is at least one character in the string.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def isspace(self):
-        return self._vectorize_boolean(str.isspace)
+        """
+        Return True all characters in the string are whitespace, False otherwise.
+        """
+        raise NotImplementedError
 
+    @abstractmethod
     def islower(self):
-        return self._vectorize_boolean(str.islower)
+        """
+        Return True if the non-empty string is in lower case, False otherwise.
+        """
+        raise NotImplementedError
 
+    @abstractmethod
     def isupper(self):
-        return self._vectorize_boolean(str.isupper)
+        """
+        Return True if the non-empty string is in upper case, False otherwise.
+        """
+        raise NotImplementedError
 
+    @abstractmethod
     def istitle(self):
-        return self._vectorize_boolean(str.istitle)
+        """
+        Return True if each word of the string starts with an
+        upper case letter, False otherwise.
+        """
+        raise NotImplementedError
 
     # Convert strings in the Column -----------------------------------------------------
 
-    def lower(self) -> IStringColumn:
+    @abstractmethod
+    def lower(self) -> StringColumn:
         """
         Convert strings in the Column to lowercase.
         Equivalent to :meth:`str.lower`.
         """
-        return self._vectorize_string(str.lower)
+        raise NotImplementedError
 
-    def upper(self) -> IStringColumn:
+    @abstractmethod
+    def upper(self) -> StringColumn:
         """
         Convert strings in the Column to uppercase.
         Equivalent to :meth:`str.upper`.
         """
-        return self._vectorize_string(str.upper)
+        raise NotImplementedError
 
     # Pattern matching related methods  -----------------------------------------------------
+
+    @abstractmethod
     def startswith(self, pat):
         """Test if the beginning of each string element matches a pattern."""
+        raise NotImplementedError
 
-        def pred(i):
-            return i.startswith(pat)
-
-        return self._vectorize_boolean(pred)
-
+    @abstractmethod
     def endswith(self, pat):
         """Test if the end of each string element matches a pattern."""
+        raise NotImplementedError
 
-        def pred(i):
-            return i.endswith(pat)
+    @abstractmethod
+    def count(self, pat: str):
+        """Count occurrences of pattern in each string of column"""
+        raise NotImplementedError
 
-        return self._vectorize_boolean(pred)
-
+    @abstractmethod
     def find(self, sub):
-        def fun(i):
-            return i.find(sub)
+        """Return lowest indices in each strings in the Column."""
+        raise NotImplementedError
 
-        return self._vectorize_int64(fun)
-
-    def replace(self, old, new):
+    @abstractmethod
+    def replace(self, pat: str, repl: str, regex: bool = True):
         """
         Replace each occurrence of pattern in the Column.
         """
-        return self._vectorize_string(lambda s: s.replace(old, new))
+        raise NotImplementedError
 
-    # Regular expressions -----------------------------------------------------
-    #
-    # Only allow string type for pattern input so it can be dispatch to other runtime (Velox, cuDF, etc)
+    @abstractmethod
+    def match(self, pat: str):
+        """Determine if each string matches a regular expression"""
+        raise NotImplementedError
 
-    def count_re(self, pattern: str):
-        """Count occurrences of pattern in each string"""
-        return self.findall_re(pattern).list.length()
-
-    def match_re(self, pattern: str):
-        """Determine if each string matches a regular expression (see re.match())"""
-        pattern = re.compile(pattern)
-
-        def func(text):
-            return True if pattern.match(text) else False
-
-        return self._vectorize_boolean(func)
-
-    def replace_re(self, pattern: str, repl: str, count=0):
-        """Replace for each item the search string or pattern with the given value"""
-
-        pattern = re.compile(pattern)
-
-        def func(text):
-            return re.sub(pattern, repl, text, count)
-
-        return self._vectorize_string(func)
-
-    def contains_re(
-        self,
-        pattern: str,
-    ):
+    @abstractmethod
+    def contains(self, pat: str, regex: bool = True):
         """Test for each item if pattern is contained within a string; returns a boolean"""
+        raise NotImplementedError
 
-        pattern = re.compile(pattern)
-
-        def func(text):
-            return pattern.search(text) is not None
-
-        return self._vectorize_boolean(func)
-
-    def findall_re(self, pattern: str):
+    @abstractmethod
+    def findall(self, pat: str):
         """
         Find for each item all occurrences of pattern (see re.findall())
         """
-        pattern = re.compile(pattern)
+        raise NotImplementedError
 
-        def func(text):
-            return pattern.findall(text)
-
-        return self._vectorize_list_string(func)
-
-    # helper -----------------------------------------------------
-
-    def _vectorize_boolean(self, pred):
-        return self._parent._vectorize(pred, dt.Boolean(self._parent.dtype.nullable))
-
-    def _vectorize_string(self, func):
-        return self._parent._vectorize(func, dt.String(self._parent.dtype.nullable))
-
-    def _vectorize_list_string(self, func):
-        return self._parent._vectorize(
-            func, dt.List(dt.string, self._parent.dtype.nullable)
-        )
-
-    def _vectorize_int64(self, func):
-        return self._parent._vectorize(func, dt.Int64(self._parent.dtype.nullable))
-
-    def _not_supported(self, name):
-        raise TypeError(f"{name} for type {type(self).__name__} is not supported")
+    @abstractmethod
+    def cat(self, col: StringColumn):
+        # TODO: docstring
+        raise NotImplementedError
